@@ -177,15 +177,20 @@ fn main() {
         .write_to_file(out_dir.join("bindings.rs"))
         .unwrap();
 
-    if platform_name == "linux" {
-        println!(
-            "cargo:rustc-link-search=native={}",
-            alvr_filesystem::workspace_dir()
-                .join("openvr/lib/linux64")
-                .to_string_lossy()
-        );
-        println!("cargo:rustc-link-lib=openvr_api");
-    } else if platform_name == "windows" {
+        if platform_name == "linux" {
+            let arch = if cfg!(target_arch = "aarch64") {
+                "linuxarm64"
+            } else {
+                "linux64"
+            };
+            println!(
+                "cargo:rustc-link-search=native={}",
+                alvr_filesystem::workspace_dir()
+                    .join(format!("openvr/lib/{}", arch))
+                    .to_string_lossy()
+            );
+            println!("cargo:rustc-link-lib=openvr_api");
+        } else if platform_name == "windows" {
         println!(
             "cargo:rustc-link-search=native={}",
             alvr_filesystem::workspace_dir()

@@ -247,13 +247,17 @@ impl Layout {
         let platform = if cfg!(windows) {
             "win64"
         } else if cfg!(target_os = "linux") {
-            "linux64"
+            if cfg!(target_arch = "aarch64") {
+                "linuxarm64"
+            } else  {
+                "linux64"
+            }
         } else if cfg!(target_os = "macos") {
             "macos"
         } else {
-            unimplemented!()
+            unimplemented!("Unsupported operating system")
         };
-
+    
         self.openvr_driver_root_dir.join("bin").join(platform)
     }
 
