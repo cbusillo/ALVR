@@ -1,4 +1,5 @@
 #include "CEncoder.h"
+#include "VideoEncoderSocket.h"
 
 CEncoder::CEncoder()
     : m_bExiting(false)
@@ -19,8 +20,23 @@ void CEncoder::Initialize(std::shared_ptr<CD3DRender> d3dRender) {
     uint32_t encoderWidth, encoderHeight;
     m_FrameRender->GetEncodingResolution(&encoderWidth, &encoderHeight);
 
+    Exception socketException;
     Exception vceException;
     Exception nvencException;
+
+    // Try socket encoder first (for Wine/CrossOver with macOS VideoToolbox server)
+    try {
+        Debug("Try to use VideoEncoderSocket (Wine -> macOS).\n");
+        m_videoEncoder
+            = std::make_shared<VideoEncoderSocket>(d3dRender, encoderWidth, encoderHeight);
+        m_videoEncoder->Initialize();
+        Info("Using VideoEncoderSocket for macOS streaming.\n");
+        return;
+    } catch (Exception e) {
+        socketException = e;
+        Debug("VideoEncoderSocket not available: %s\n", e.what());
+    }
+
 #ifdef ALVR_GPL
     Exception swException;
     if (Settings::Instance().m_force_sw_encoding) {
@@ -63,14 +79,16 @@ void CEncoder::Initialize(std::shared_ptr<CD3DRender> d3dRender) {
         swException = e;
     }
     throw MakeException(
-        "All VideoEncoder are not available. VCE: %s, NVENC: %s, SW: %s",
+        "All VideoEncoder are not available. Socket: %s, VCE: %s, NVENC: %s, SW: %s",
+        socketException.what(),
         vceException.what(),
         nvencException.what(),
         swException.what()
     );
 #else
     throw MakeException(
-        "All VideoEncoder are not available. VCE: %s, NVENC: %s",
+        "All VideoEncoder are not available. Socket: %s, VCE: %s, NVENC: %s",
+        socketException.what(),
         vceException.what(),
         nvencException.what()
     );

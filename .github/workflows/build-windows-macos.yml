@@ -1,0 +1,45 @@
+name: Build Windows Streamer for macOS
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [macos-v20.14.1]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build_windows_streamer:
+    runs-on: windows-2022
+    steps:
+      - name: Configure git
+        run: git config --global core.autocrlf false
+
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: crazy-max/ghaction-chocolatey@v1
+        with:
+          args: install zip unzip pkgconfiglite
+
+      - name: Prepare deps
+        env:
+          RUST_BACKTRACE: 1
+        run: cargo xtask prepare-deps --platform windows
+
+      - name: Build streamer
+        env:
+          RUST_BACKTRACE: 1
+        run: cargo xtask package-streamer --ci
+
+      - name: Upload Windows streamer artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: alvr_streamer_windows
+          path: ./build/alvr_streamer_windows.zip
+          retention-days: 30

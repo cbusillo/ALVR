@@ -67,13 +67,23 @@ fn main() {
         .include("cpp");
 
     if platform_name == "windows" {
+        // Check if using MSVC or MinGW
+        let target_env = env::var("CARGO_CFG_TARGET_ENV").unwrap_or_default();
+        let is_msvc = target_env == "msvc";
+
         build
             .debug(false) // This is because we cannot link to msvcrtd (see below)
-            .flag("/permissive-")
             .define("NOMINMAX", None)
             .define("_WINSOCKAPI_", None)
             .define("_MBCS", None)
             .define("_MT", None);
+
+        if is_msvc {
+            build.flag("/permissive-");
+        } else {
+            // MinGW/GCC: use standard C++ conformance flags
+            build.flag("-fpermissive");
+        }
     } else if platform_name == "macos" {
         build.define("__APPLE__", None);
     }
@@ -193,6 +203,32 @@ fn main() {
                 .to_string_lossy()
         );
         println!("cargo:rustc-link-lib=openvr_api");
+    } else if platform_name == "macos" {
+        // OpenVR library (osx32 contains universal binary with i386+x86_64)
+        // Note: ARM64 builds will need to use x86_64 under Rosetta 2
+        println!(
+            "cargo:rustc-link-search=native={}",
+            alvr_filesystem::workspace_dir()
+                .join("openvr/lib/osx32")
+                .to_string_lossy()
+        );
+        println!("cargo:rustc-link-lib=openvr_api");
+
+        // macOS frameworks for VideoToolbox encoding
+        println!("cargo:rustc-link-lib=framework=VideoToolbox");
+        println!("cargo:rustc-link-lib=framework=CoreMedia");
+        println!("cargo:rustc-link-lib=framework=CoreVideo");
+        println!("cargo:rustc-link-lib=framework=CoreFoundation");
+        println!("cargo:rustc-link-lib=framework=IOSurface");
+
+        // Vulkan via MoltenVK (installed via Homebrew or Vulkan SDK)
+        if let Ok(vulkan_sdk) = env::var("VULKAN_SDK") {
+            println!("cargo:rustc-link-search=native={}/lib", vulkan_sdk);
+        }
+        // Add Homebrew library paths for Vulkan
+        println!("cargo:rustc-link-search=native=/opt/homebrew/lib");  // ARM64 Homebrew
+        println!("cargo:rustc-link-search=native=/usr/local/lib");     // x86_64 Homebrew
+        println!("cargo:rustc-link-lib=vulkan");
     }
 
     #[cfg(target_os = "linux")]
