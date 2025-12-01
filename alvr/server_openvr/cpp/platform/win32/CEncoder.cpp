@@ -1,5 +1,5 @@
 #include "CEncoder.h"
-#include "VideoEncoderSocket.h"
+#include "VideoEncoderSharedMem.h"
 
 CEncoder::CEncoder()
     : m_bExiting(false)
@@ -20,21 +20,21 @@ void CEncoder::Initialize(std::shared_ptr<CD3DRender> d3dRender) {
     uint32_t encoderWidth, encoderHeight;
     m_FrameRender->GetEncodingResolution(&encoderWidth, &encoderHeight);
 
-    Exception socketException;
+    Exception shmException;
     Exception vceException;
     Exception nvencException;
 
-    // Try socket encoder first (for Wine/CrossOver with macOS VideoToolbox server)
+    // Try shared memory encoder first (for Wine/CrossOver with macOS VideoToolbox)
     try {
-        Debug("Try to use VideoEncoderSocket (Wine -> macOS).\n");
+        Debug("Try to use VideoEncoderSharedMem (Wine -> macOS via shared memory).\n");
         m_videoEncoder
-            = std::make_shared<VideoEncoderSocket>(d3dRender, encoderWidth, encoderHeight);
+            = std::make_shared<VideoEncoderSharedMem>(d3dRender, encoderWidth, encoderHeight);
         m_videoEncoder->Initialize();
-        Info("Using VideoEncoderSocket for macOS streaming.\n");
+        Info("Using VideoEncoderSharedMem for macOS streaming.\n");
         return;
     } catch (Exception e) {
-        socketException = e;
-        Debug("VideoEncoderSocket not available: %s\n", e.what());
+        shmException = e;
+        Debug("VideoEncoderSharedMem not available: %s\n", e.what());
     }
 
 #ifdef ALVR_GPL
@@ -80,7 +80,7 @@ void CEncoder::Initialize(std::shared_ptr<CD3DRender> d3dRender) {
     }
     throw MakeException(
         "All VideoEncoder are not available. Socket: %s, VCE: %s, NVENC: %s, SW: %s",
-        socketException.what(),
+        shmException.what(),
         vceException.what(),
         nvencException.what(),
         swException.what()
@@ -88,7 +88,7 @@ void CEncoder::Initialize(std::shared_ptr<CD3DRender> d3dRender) {
 #else
     throw MakeException(
         "All VideoEncoder are not available. Socket: %s, VCE: %s, NVENC: %s",
-        socketException.what(),
+        shmException.what(),
         vceException.what(),
         nvencException.what()
     );

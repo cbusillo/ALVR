@@ -1,0 +1,36 @@
+[package]
+name = "alvr_macos_bridge"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Native macOS bridge for ALVR Wine streaming"
+
+[[bin]]
+name = "alvr_macos_bridge"
+path = "src/main.rs"
+
+[dependencies]
+alvr_common = { workspace = true }
+alvr_filesystem = { workspace = true }
+alvr_server_core = { workspace = true }
+alvr_session = { workspace = true }
+alvr_sockets = { workspace = true }
+
+# Core dependencies
+anyhow = "1"
+log = "0.4"
+env_logger = "0.10"
+tokio = { version = "1", features = ["full"] }
+
+# Shared memory
+memmap2 = "0.9"
+libc = "0.2"
+dirs = "5"
+
+# VideoToolbox bindings (macOS)
+[target.'cfg(target_os = "macos")'.dependencies]
+core-foundation = "0.9"
+core-video-sys = "0.1"
+shiguredo_video_toolbox = "2025.1"
