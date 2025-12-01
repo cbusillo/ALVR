@@ -1,7 +1,10 @@
 #pragma once
 
+#include <winsock2.h>
+#include <ws2tcpip.h>
 #include "VideoEncoder.h"
 #include "shared/d3drender.h"
+#include <wrl/client.h>
 #include <memory>
 #include <string>
 #include <vector>
@@ -66,8 +69,8 @@ private:
     uint32_t m_width;
     uint32_t m_height;
 
-    // Socket (Unix socket via Wine, or -1 if not connected)
-    int m_socket;
+    // Socket (TCP socket via Wine/Winsock)
+    SOCKET m_socket;
     std::string m_socketPath;
     bool m_connected;
     bool m_initSent;

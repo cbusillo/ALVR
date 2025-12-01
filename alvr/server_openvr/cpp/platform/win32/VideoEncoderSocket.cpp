@@ -1,10 +1,6 @@
 #include "VideoEncoderSocket.h"
 #include "alvr_server/Logger.h"
 
-// Use TCP sockets - works in Wine and native Windows
-#include <winsock2.h>
-#include <ws2tcpip.h>
-
 #pragma comment(lib, "ws2_32.lib")
 
 // TCP port for ALVR macOS server
