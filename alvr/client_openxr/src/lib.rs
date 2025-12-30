@@ -15,7 +15,7 @@ use alvr_common::{
     parking_lot::RwLock,
 };
 use alvr_graphics::GraphicsContext;
-use alvr_session::{BodyTrackingBDConfig, BodyTrackingSourcesConfig};
+use alvr_session::{BodyTrackingBDConfig, BodyTrackingSourcesConfig, PerformanceLevel};
 use alvr_system_info::Platform;
 use extra_extensions::{
     BD_BODY_TRACKING_EXTENSION_NAME, BD_MOTION_TRACKING_EXTENSION_NAME,
@@ -93,6 +93,32 @@ fn from_xr_time(timestamp: xr::Time) -> Duration {
 
 fn to_xr_time(timestamp: Duration) -> xr::Time {
     xr::Time::from_nanos(timestamp.as_nanos() as _)
+}
+
+fn to_perf_settings_level(level: PerformanceLevel) -> xr::PerfSettingsLevelEXT {
+    match level {
+        PerformanceLevel::PowerSavings => xr::PerfSettingsLevelEXT::POWER_SAVINGS,
+        PerformanceLevel::SustainedLow => xr::PerfSettingsLevelEXT::SUSTAINED_LOW,
+        PerformanceLevel::SustainedHigh => xr::PerfSettingsLevelEXT::SUSTAINED_HIGH,
+        PerformanceLevel::Boost => xr::PerfSettingsLevelEXT::BOOST,
+    }
+}
+
+fn set_performance_level(
+    xr_instance: &xr::Instance,
+    xr_session: &xr::Session<xr::OpenGlEs>,
+    domain: xr::PerfSettingsDomainEXT,
+    level: PerformanceLevel,
+) {
+    if let Some(performance_settings) = xr_instance.exts().ext_performance_settings {
+        unsafe {
+            (performance_settings.perf_settings_set_performance_level)(
+                xr_session.as_raw(),
+                domain,
+                to_perf_settings_level(level),
+            );
+        }
+    }
 }
 
 fn default_view() -> xr::View {
@@ -182,6 +208,7 @@ pub fn entry_point() {
     exts.ext_eye_gaze_interaction = available_extensions.ext_eye_gaze_interaction;
     exts.ext_hand_tracking = available_extensions.ext_hand_tracking;
     exts.ext_local_floor = available_extensions.ext_local_floor;
+    exts.ext_performance_settings = available_extensions.ext_performance_settings;
     exts.ext_user_presence = available_extensions.ext_user_presence;
     exts.fb_body_tracking = available_extensions.fb_body_tracking;
     exts.fb_color_space = available_extensions.fb_color_space;
@@ -512,6 +539,24 @@ pub fn entry_point() {
                             passthrough_layer = PassthroughLayer::new(&xr_session, platform).ok();
                         } else if config.passthrough.is_none() && passthrough_layer.is_some() {
                             passthrough_layer = None;
+                        }
+
+                        if let Some(cpu_performance_level) = &config.cpu_performance_level {
+                            set_performance_level(
+                                &xr_instance,
+                                &xr_session,
+                                xr::PerfSettingsDomainEXT::CPU,
+                                cpu_performance_level.clone(),
+                            );
+                        }
+
+                        if let Some(gpu_performance_level) = &config.gpu_performance_level {
+                            set_performance_level(
+                                &xr_instance,
+                                &xr_session,
+                                xr::PerfSettingsDomainEXT::GPU,
+                                gpu_performance_level.clone(),
+                            );
                         }
 
                         if let Some(stream) = &mut stream_context {

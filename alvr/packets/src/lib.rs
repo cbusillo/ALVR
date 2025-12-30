@@ -5,7 +5,8 @@ use alvr_common::{
     semver::Version,
 };
 use alvr_session::{
-    ClientsidePostProcessingConfig, CodecType, PassthroughMode, SessionConfig, Settings,
+    ClientsidePostProcessingConfig, CodecType, PassthroughMode, PerformanceLevel, SessionConfig,
+    Settings,
 };
 use serde::{Deserialize, Serialize};
 use serde_json as json;
@@ -327,6 +328,8 @@ pub enum FirewallRulesAction {
 pub struct RealTimeConfig {
     pub passthrough: Option<PassthroughMode>,
     pub clientside_post_processing: Option<ClientsidePostProcessingConfig>,
+    pub cpu_performance_level: Option<PerformanceLevel>,
+    pub gpu_performance_level: Option<PerformanceLevel>,
     pub ext_str: String,
 }
 
@@ -339,6 +342,8 @@ impl RealTimeConfig {
                 .clientside_post_processing
                 .clone()
                 .into_option(),
+            cpu_performance_level: settings.headset.performance_level.clone().cpu.into_option(),
+            gpu_performance_level: settings.headset.performance_level.clone().gpu.into_option(),
             ext_str: String::new(), // No extensions for now
         }
     }

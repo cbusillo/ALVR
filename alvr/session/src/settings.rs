@@ -878,6 +878,34 @@ pub enum HeadsetEmulationMode {
     },
 }
 
+#[derive(SettingsSchema, Serialize, Deserialize, PartialEq, Clone)]
+pub enum PerformanceLevel {
+    #[schema(strings(display_name = "Power Saving"))]
+    PowerSavings,
+    #[schema(strings(display_name = "Sustained Low"))]
+    SustainedLow,
+    #[schema(strings(display_name = "Sustained High"))]
+    SustainedHigh,
+    #[schema(flag = "hidden")]
+    Boost,
+}
+
+#[derive(SettingsSchema, Serialize, Deserialize, PartialEq, Clone)]
+pub struct PerformanceLevelConfig {
+    #[schema(flag = "real-time")]
+    #[schema(strings(
+        display_name = "CPU",
+        help = "When disabling this, the client needs to be restarted for the change to be applied."
+    ))]
+    pub cpu: Switch<PerformanceLevel>,
+    #[schema(flag = "real-time")]
+    #[schema(strings(
+        display_name = "GPU",
+        help = "When disabling this, the client needs to be restarted for the change to be applied."
+    ))]
+    pub gpu: Switch<PerformanceLevel>,
+}
+
 #[derive(SettingsSchema, Serialize, Deserialize, Clone, PartialEq)]
 pub enum FaceTrackingSourcesConfig {
     PreferEyeTrackingOnly,
@@ -1273,6 +1301,14 @@ Tilted: the world gets tilted when long pressing the oculus button. This is usef
 
     #[schema(flag = "steamvr-restart")]
     pub emulation_mode: HeadsetEmulationMode,
+
+    #[schema(strings(
+        help = r#"Power Savings might increase latency or reduce framerate consistency but decreases temperatures and improves battery life.
+Sustained Low provides consistent framerates but might increase latency if necessary.
+Sustained High provides consistent framerates but increases temperature.
+This is mainly for Quest headsets, mileage may vary on other devices."#
+    ))]
+    pub performance_level: PerformanceLevelConfig,
 
     #[schema(flag = "steamvr-restart")]
     #[schema(strings(display_name = "Extra OpenVR properties"))]
@@ -1922,6 +1958,20 @@ pub fn session_settings_default() -> SettingsDefault {
                     serial_number: "Unknown".into(),
                 },
                 variant: HeadsetEmulationModeDefaultVariant::Quest2,
+            },
+            performance_level: PerformanceLevelConfigDefault {
+                cpu: SwitchDefault {
+                    enabled: false,
+                    content: PerformanceLevelDefault {
+                        variant: PerformanceLevelDefaultVariant::PowerSavings,
+                    },
+                },
+                gpu: SwitchDefault {
+                    enabled: false,
+                    content: PerformanceLevelDefault {
+                        variant: PerformanceLevelDefaultVariant::PowerSavings,
+                    },
+                },
             },
             extra_openvr_props: default_custom_openvr_props.clone(),
             tracking_ref_only: false,
