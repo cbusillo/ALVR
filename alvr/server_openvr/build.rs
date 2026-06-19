@@ -34,6 +34,10 @@ fn get_linux_x264_path() -> PathBuf {
 fn main() {
     let platform_name = env::var("CARGO_CFG_TARGET_OS").unwrap();
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
+    let disable_vpl = platform_name == "windows"
+        && env::var("ALVR_BUILD_DISABLE_VPL").ok().as_deref() == Some("1");
+
+    println!("cargo:rerun-if-env-changed=ALVR_BUILD_DISABLE_VPL");
 
     let platform_subpath = match platform_name.as_str() {
         "windows" => "cpp/platform/win32",
@@ -60,12 +64,17 @@ fn main() {
         .collect::<Vec<_>>();
 
     let source_files_paths = cpp_paths.iter().filter(|path| {
-        path.extension()
+        let is_cpp_source = path
+            .extension()
             .filter(|ext| {
                 let ext_str = ext.to_string_lossy();
                 ext_str == "c" || ext_str == "cpp"
             })
-            .is_some()
+            .is_some();
+
+        is_cpp_source
+            && !(disable_vpl
+                && path.file_name().and_then(|name| name.to_str()) == Some("VideoEncoderVPL.cpp"))
     });
 
     let mut build = cc::Build::new();
@@ -84,6 +93,10 @@ fn main() {
             .define("_WINSOCKAPI_", None)
             .define("_MBCS", None)
             .define("_MT", None);
+
+        if disable_vpl {
+            build.define("ALVR_DISABLE_VPL", None);
+        }
     } else if platform_name == "macos" {
         build.define("__APPLE__", None);
     }
@@ -119,18 +132,20 @@ fn main() {
     build.define("ALVR_GPL", None);
 
     if platform_name == "windows" {
-        let vpl_path = alvr_filesystem::deps_dir().join("windows/libvpl/alvr_build");
-        let vpl_include_path = vpl_path.join("include");
-        let vpl_lib_path = vpl_path.join("lib");
+        if !disable_vpl {
+            let vpl_path = alvr_filesystem::deps_dir().join("windows/libvpl/alvr_build");
+            let vpl_include_path = vpl_path.join("include");
+            let vpl_lib_path = vpl_path.join("lib");
 
-        println!(
-            "cargo:rustc-link-search=native={}",
-            vpl_lib_path.to_string_lossy()
-        );
+            println!(
+                "cargo:rustc-link-search=native={}",
+                vpl_lib_path.to_string_lossy()
+            );
 
-        build.define("ONEVPL_EXPERIMENTAL", None);
-        build.include(vpl_include_path);
-        println!("cargo:rustc-link-lib=vpl");
+            build.define("ONEVPL_EXPERIMENTAL", None);
+            build.include(vpl_include_path);
+            println!("cargo:rustc-link-lib=vpl");
+        }
     }
 
     build.compile("bindings");

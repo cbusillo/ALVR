@@ -1,4 +1,9 @@
 #include "CEncoder.h"
+#include "VideoEncoderSharedMem.h"
+#include "alvr_server/Logger.h"
+
+#include <cstdlib>
+#include <cstring>
 
 CEncoder::CEncoder()
     : m_bExiting(false)
@@ -19,9 +24,20 @@ void CEncoder::Initialize(std::shared_ptr<CD3DRender> d3dRender) {
     uint32_t encoderWidth, encoderHeight;
     m_FrameRender->GetEncodingResolution(&encoderWidth, &encoderHeight);
 
-    Exception vplException;
+    const char* useSharedMemEncoder = std::getenv("ALVR_MACOS_SHM_ENCODER");
+    if (useSharedMemEncoder && std::strcmp(useSharedMemEncoder, "1") == 0) {
+        Info("Using VideoEncoderSharedMem because ALVR_MACOS_SHM_ENCODER=1.\n");
+        m_videoEncoder
+            = std::make_shared<VideoEncoderSharedMem>(d3dRender, encoderWidth, encoderHeight);
+        m_videoEncoder->Initialize();
+        return;
+    }
+
     Exception vceException;
     Exception nvencException;
+#ifndef ALVR_DISABLE_VPL
+    Exception vplException;
+#endif
 #ifdef ALVR_GPL
     Exception swException;
 
@@ -55,6 +71,7 @@ void CEncoder::Initialize(std::shared_ptr<CD3DRender> d3dRender) {
     } catch (Exception e) {
         nvencException = e;
     }
+#ifndef ALVR_DISABLE_VPL
     try {
         Debug("Try to use VideoEncoderVPL.\n");
         m_videoEncoder = std::make_shared<VideoEncoderVPL>(d3dRender, encoderWidth, encoderHeight);
@@ -63,6 +80,7 @@ void CEncoder::Initialize(std::shared_ptr<CD3DRender> d3dRender) {
     } catch (Exception e) {
         vplException = e;
     }
+#endif
 #ifdef ALVR_GPL
     try {
         Debug("Try to use VideoEncoderSW.\n");
@@ -72,6 +90,7 @@ void CEncoder::Initialize(std::shared_ptr<CD3DRender> d3dRender) {
     } catch (Exception e) {
         swException = e;
     }
+#ifndef ALVR_DISABLE_VPL
     throw MakeException(
         "All VideoEncoder are not available. VCE: %s, NVENC: %s, VPL: %s, SW: %s",
         vceException.what(),
@@ -81,11 +100,27 @@ void CEncoder::Initialize(std::shared_ptr<CD3DRender> d3dRender) {
     );
 #else
     throw MakeException(
+        "All VideoEncoder are not available. VCE: %s, NVENC: %s, SW: %s",
+        vceException.what(),
+        nvencException.what(),
+        swException.what()
+    );
+#endif
+#else
+#ifndef ALVR_DISABLE_VPL
+    throw MakeException(
         "All VideoEncoder are not available. VCE: %s, NVENC: %s, VPL: %s",
         vceException.what(),
         nvencException.what(),
         vplException.what()
     );
+#else
+    throw MakeException(
+        "All VideoEncoder are not available. VCE: %s, NVENC: %s",
+        vceException.what(),
+        nvencException.what()
+    );
+#endif
 #endif
 }
 

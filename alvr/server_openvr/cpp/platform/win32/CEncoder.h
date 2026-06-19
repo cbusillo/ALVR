@@ -7,7 +7,9 @@
 #include "VideoEncoder.h"
 #include "VideoEncoderAMF.h"
 #include "VideoEncoderNVENC.h"
+#ifndef ALVR_DISABLE_VPL
 #include "VideoEncoderVPL.h"
+#endif
 #include "alvr_server/Utils.h"
 #include <d3d11.h>
 #include <d3d11_1.h>

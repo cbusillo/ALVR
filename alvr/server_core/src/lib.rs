@@ -11,7 +11,7 @@ mod tracking;
 mod web_server;
 
 pub use c_api::*;
-pub use logging_backend::init_logging;
+pub use logging_backend::{init_logging, init_logging_headless};
 pub use tracking::HandType;
 
 use crate::connection::VideoPacket;

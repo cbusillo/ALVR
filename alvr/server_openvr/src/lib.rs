@@ -31,6 +31,7 @@ use alvr_session::{
 };
 use std::{
     collections::VecDeque,
+    env,
     ffi::{CString, OsStr, c_char, c_void},
     ptr,
     sync::{Once, mpsc},
@@ -740,7 +741,8 @@ pub unsafe extern "C" fn HmdDriverFactory(
             // When there is already a ALVR dashboard running, initialize the HMD device early to
             // avoid buggy SteamVR behavior
             // NB: we already bail out before if the dashboards don't belong to this streamer
-            let early_hmd_initialization = !dashboard_processes.is_empty();
+            let early_hmd_initialization = !dashboard_processes.is_empty()
+                || env::var("ALVR_MACOS_SHM_ENCODER").ok().as_deref() == Some("1");
 
             CppInit(early_hmd_initialization, make_settings(None));
         }

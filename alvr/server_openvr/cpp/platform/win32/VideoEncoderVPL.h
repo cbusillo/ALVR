@@ -2,10 +2,10 @@
 
 #include "VideoEncoder.h"
 #include "shared/d3drender.h"
-#include <atlbase.h>
 #include <d3d11.h>
 #include <dxgi.h>
 #include <vector>
+#include <wrl/client.h>
 
 #include "vpl/mfx.h"
 #include "vpl/mfxjpeg.h"
@@ -60,5 +60,5 @@ private:
     mfxSession m_vplSession = nullptr;
     mfxBitstream m_vplBitstream = {};
     mfxMemoryInterface* m_vplMemoryInterface = nullptr;
-    CComPtr<ID3D11Texture2D> m_transferTex;
+    Microsoft::WRL::ComPtr<ID3D11Texture2D> m_transferTex;
 };
