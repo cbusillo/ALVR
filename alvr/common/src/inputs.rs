@@ -6,7 +6,7 @@ use std::{
 
 macro_rules! interaction_profile {
     ($ty:ident, $path:expr) => {
-        paste::paste! {
+        pastey::paste! {
             pub const [<$ty _CONTROLLER_PROFILE_PATH>]: &str =
                 concat!("/interaction_profiles/", $path, "_controller");
             pub static [<$ty _CONTROLLER_PROFILE_ID>]: LazyLock<u64> =
@@ -28,7 +28,7 @@ interaction_profile!(YVR, "yvr/touch");
 
 macro_rules! devices {
     ($(($name:ident, $path:expr),)*) => {
-        paste::paste! {
+        pastey::paste! {
             $(
                 pub const [<$name _PATH>]: &str = $path;
                 pub static [<$name _ID>]: LazyLock<u64> = LazyLock::new(|| hash_string([<$name _PATH>]));
@@ -79,7 +79,7 @@ pub struct ButtonInfo {
 
 macro_rules! controller_inputs {
     ($(($inputs:ident, $paths:literal, $ty:ident),)*) => {
-        paste::paste! {
+        pastey::paste! {
             $(
                 pub const [<LEFT_ $inputs _PATH>]: &str =
                     concat!("/user/hand/left/input/", $paths);
@@ -135,9 +135,11 @@ controller_inputs! {
     (SQUEEZE_TOUCH, "squeeze/touch", Binary),
     (SQUEEZE_VALUE, "squeeze/value", Scalar),
     (SQUEEZE_FORCE, "squeeze/force", Scalar),
+    (SQUEEZE_SENSOR_VALUE, "squeeze/sensor/value", Scalar),
     (TRIGGER_CLICK, "trigger/click", Binary),
     (TRIGGER_VALUE, "trigger/value", Scalar),
     (TRIGGER_TOUCH, "trigger/touch", Binary),
+    (TRIGGER_SENSOR_VALUE, "trigger/sensor/value", Scalar),
     (THUMBSTICK_X, "thumbstick/x", Scalar),
     (THUMBSTICK_Y, "thumbstick/y", Scalar),
     (THUMBSTICK_CLICK, "thumbstick/click", Binary),
@@ -434,6 +436,7 @@ pub static CONTROLLER_PROFILE_INFO: LazyLock<HashMap<u64, InteractionProfileInfo
                         *LEFT_TRIGGER_CLICK_ID,
                         *LEFT_TRIGGER_VALUE_ID,
                         *LEFT_TRIGGER_TOUCH_ID,
+                        *LEFT_TRIGGER_SENSOR_VALUE_ID,
                         *LEFT_THUMBSTICK_Y_ID,
                         *LEFT_THUMBSTICK_X_ID,
                         *LEFT_THUMBSTICK_CLICK_ID,
@@ -441,6 +444,7 @@ pub static CONTROLLER_PROFILE_INFO: LazyLock<HashMap<u64, InteractionProfileInfo
                         *LEFT_SQUEEZE_CLICK_ID,
                         *LEFT_SQUEEZE_VALUE_ID,
                         *LEFT_SQUEEZE_TOUCH_ID,
+                        *LEFT_SQUEEZE_SENSOR_VALUE_ID,
                         *RIGHT_A_CLICK_ID,
                         *RIGHT_A_TOUCH_ID,
                         *RIGHT_B_CLICK_ID,
@@ -452,6 +456,7 @@ pub static CONTROLLER_PROFILE_INFO: LazyLock<HashMap<u64, InteractionProfileInfo
                         *RIGHT_TRIGGER_CLICK_ID,
                         *RIGHT_TRIGGER_VALUE_ID,
                         *RIGHT_TRIGGER_TOUCH_ID,
+                        *RIGHT_TRIGGER_SENSOR_VALUE_ID,
                         *RIGHT_THUMBSTICK_Y_ID,
                         *RIGHT_THUMBSTICK_X_ID,
                         *RIGHT_THUMBSTICK_CLICK_ID,
@@ -459,6 +464,7 @@ pub static CONTROLLER_PROFILE_INFO: LazyLock<HashMap<u64, InteractionProfileInfo
                         *RIGHT_SQUEEZE_CLICK_ID,
                         *RIGHT_SQUEEZE_VALUE_ID,
                         *RIGHT_SQUEEZE_TOUCH_ID,
+                        *RIGHT_SQUEEZE_SENSOR_VALUE_ID,
                     ]
                     .into_iter()
                     .collect(),

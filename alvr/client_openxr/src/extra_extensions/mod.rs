@@ -3,7 +3,7 @@ mod body_tracking_fb;
 mod eye_gaze_interaction;
 mod eye_tracking_social;
 mod face_tracking2_fb;
-mod face_tracking_pico;
+mod facial_simulation_bd;
 mod facial_tracking_htc;
 mod motion_tracking_bd;
 mod multimodal_input;
@@ -14,17 +14,17 @@ pub use body_tracking_bd::*;
 pub use body_tracking_fb::*;
 pub use eye_gaze_interaction::*;
 pub use eye_tracking_social::*;
-pub use face_tracking_pico::*;
 pub use face_tracking2_fb::*;
+pub use facial_simulation_bd::*;
 pub use facial_tracking_htc::*;
 pub use motion_tracking_bd::*;
 pub use multimodal_input::*;
 pub use passthrough_fb::*;
 pub use passthrough_htc::*;
-use std::ffi::CString;
-use std::mem;
 
 use openxr::{self as xr, sys};
+use std::ffi::CString;
+use std::mem;
 
 fn xr_res(result: sys::Result) -> xr::Result<()> {
     if result.into_raw() >= 0 {
