@@ -134,12 +134,19 @@ fn connection_pipeline(
         let listener_socket =
             alvr_sockets::get_server_listener(HANDSHAKE_ACTION_TIMEOUT).to_con()?;
 
+        let mut last_mdns_announce_error_log = Instant::now() - Duration::from_secs(10);
+
         loop {
             if *lifecycle_state.write() != LifecycleState::Resumed {
                 return Ok(());
             }
 
-            announcer_socket.announce().ok();
+            if let Err(e) = announcer_socket.announce()
+                && last_mdns_announce_error_log.elapsed() >= Duration::from_secs(5)
+            {
+                warn!("Failed to announce ALVR mDNS service: {e:?}");
+                last_mdns_announce_error_log = Instant::now();
+            }
 
             if let Ok(pair) = ProtoControlSocket::connect_to(
                 SOCKET_INIT_RETRY_INTERVAL,
