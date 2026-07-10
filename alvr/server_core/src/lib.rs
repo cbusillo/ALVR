@@ -19,6 +19,7 @@ use alvr_common::{
     ConnectionState, DEVICE_ID_TO_PATH, DeviceMotion, LifecycleState, Pose, RelaxedAtomic,
     ViewParams, dbg_server_core, error,
     glam::{UVec2, Vec2},
+    info,
     parking_lot::{Mutex, RwLock},
     settings_schema::Switch,
     warn,
@@ -42,7 +43,7 @@ use std::{
     io::Write,
     sync::{
         Arc, LazyLock, OnceLock,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc::{self, SyncSender, TrySendError},
     },
     thread::{self, JoinHandle},
@@ -395,12 +396,15 @@ impl ServerCoreContext {
 
         // start in the corrupts state, the client didn't receive the initial IDR yet.
         static STREAM_CORRUPTED: AtomicBool = AtomicBool::new(true);
+        static VIDEO_NAL_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+        static NO_VIDEO_SENDER_DROPS: AtomicU64 = AtomicU64::new(0);
         static LAST_IDR_INSTANT: LazyLock<Mutex<Instant>> =
             LazyLock::new(|| Mutex::new(Instant::now()));
 
-        if let Some(sender) = &*self.connection_context.video_channel_sender.lock() {
-            let buffer_size = nal_buffer.len();
+        let sequence = VIDEO_NAL_SEQUENCE.fetch_add(1, Ordering::SeqCst) + 1;
+        let buffer_size = nal_buffer.len();
 
+        if let Some(sender) = &*self.connection_context.video_channel_sender.lock() {
             if is_idr {
                 STREAM_CORRUPTED.store(false, Ordering::SeqCst);
             }
@@ -451,13 +455,37 @@ impl ServerCoreContext {
                     },
                     payload: nal_buffer,
                 });
-                if matches!(sender_result, Err(TrySendError::Full(_))) {
-                    STREAM_CORRUPTED.store(true, Ordering::SeqCst);
-                    self.connection_context
-                        .events_sender
-                        .send(ServerCoreEvent::RequestIDR)
-                        .ok();
-                    warn!("Dropping video packet. Reason: Can't push to network");
+                match sender_result {
+                    Ok(()) => {
+                        if is_idr || sequence <= 5 || sequence % 90 == 0 {
+                            info!(
+                                "queued video packet seq={sequence} timestamp_ns={} idr={is_idr} bytes={buffer_size}",
+                                timestamp.as_nanos()
+                            );
+                        }
+                    }
+                    Err(TrySendError::Full(_)) => {
+                        STREAM_CORRUPTED.store(true, Ordering::SeqCst);
+                        self.connection_context
+                            .events_sender
+                            .send(ServerCoreEvent::RequestIDR)
+                            .ok();
+                        warn!(
+                            "Dropping video packet. Reason: Can't push to network seq={sequence} timestamp_ns={} idr={is_idr} bytes={buffer_size}",
+                            timestamp.as_nanos()
+                        );
+                    }
+                    Err(TrySendError::Disconnected(_)) => {
+                        STREAM_CORRUPTED.store(true, Ordering::SeqCst);
+                        self.connection_context
+                            .events_sender
+                            .send(ServerCoreEvent::RequestIDR)
+                            .ok();
+                        warn!(
+                            "Dropping video packet. Reason: video channel disconnected seq={sequence} timestamp_ns={} idr={is_idr} bytes={buffer_size}",
+                            timestamp.as_nanos()
+                        );
+                    }
                 }
             } else {
                 warn!("Dropping video packet. Reason: Waiting for IDR frame");
@@ -470,6 +498,14 @@ impl ServerCoreContext {
                     .bitrate_manager
                     .lock()
                     .report_frame_encoded(timestamp, encoder_latency, buffer_size);
+            }
+        } else {
+            let no_sender_drops = NO_VIDEO_SENDER_DROPS.fetch_add(1, Ordering::SeqCst) + 1;
+            if is_idr || no_sender_drops <= 5 || no_sender_drops % 90 == 0 {
+                warn!(
+                    "Dropping video packet. Reason: no client video channel seq={sequence} no_sender_drops={no_sender_drops} timestamp_ns={} idr={is_idr} bytes={buffer_size}",
+                    timestamp.as_nanos()
+                );
             }
         }
     }

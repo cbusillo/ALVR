@@ -3,6 +3,10 @@ mod bgra;
 #[cfg(target_os = "macos")]
 mod encoder;
 #[cfg(target_os = "macos")]
+mod iosurface_3d;
+#[cfg(target_os = "macos")]
+mod iosurface_synthetic;
+#[cfg(target_os = "macos")]
 mod shared_memory;
 
 #[cfg(target_os = "macos")]
@@ -10,6 +14,7 @@ mod synthetic;
 
 #[cfg(target_os = "macos")]
 use std::{
+    collections::VecDeque,
     env, fs,
     path::PathBuf,
     sync::{
@@ -23,7 +28,7 @@ use std::{
 
 #[cfg(target_os = "macos")]
 use alvr_common::{
-    Fov, Pose, ViewParams,
+    Fov, HEAD_ID, Pose, ViewParams,
     glam::{Quat, Vec3},
 };
 #[cfg(target_os = "macos")]
@@ -36,6 +41,10 @@ use anyhow::{Context, Result};
 use bgra::{Nv12Frame, Nv12PixelBuffer, fill_bgra_test_pattern};
 #[cfg(target_os = "macos")]
 use encoder::{EncodedOutput, HevcEncoder};
+#[cfg(target_os = "macos")]
+use iosurface_3d::Iosurface3dFrameSource;
+#[cfg(target_os = "macos")]
+use iosurface_synthetic::IosurfaceSyntheticFrameSource;
 #[cfg(target_os = "macos")]
 use shared_memory::{FORMAT_BGRA, SharedMemory, unix_time_ns, valid_view_params};
 #[cfg(target_os = "macos")]
@@ -64,36 +73,65 @@ fn main() -> Result<()> {
     log::info!("starting ALVR macOS bridge with {config:?}");
 
     let (server_context, events_receiver) = ServerCoreContext::new();
-    server_context.start_connection();
+    let server_context = Arc::new(server_context);
+
+    let shared_memory = if config.input == BridgeInput::SharedMemory {
+        Some(Arc::new(Mutex::new(SharedMemory::create()?)))
+    } else {
+        None
+    };
 
     let force_idr = Arc::new(AtomicBool::new(true));
     let shutdown = Arc::new(AtomicBool::new(false));
     let client_view_params = Arc::new(Mutex::new(bootstrap_view_params()?));
+    let latest_tracking = Arc::new(Mutex::new(None));
     thread::spawn({
         let force_idr = Arc::clone(&force_idr);
         let shutdown = Arc::clone(&shutdown);
         let client_view_params = Arc::clone(&client_view_params);
-        move || event_loop(events_receiver, force_idr, shutdown, client_view_params)
+        let latest_tracking = Arc::clone(&latest_tracking);
+        let shared_memory = shared_memory.as_ref().map(Arc::clone);
+        let server_context = Arc::clone(&server_context);
+        move || {
+            event_loop(
+                server_context,
+                events_receiver,
+                force_idr,
+                shutdown,
+                client_view_params,
+                latest_tracking,
+                shared_memory,
+            )
+        }
     });
 
-    let (mut frame_source, stream_shape) =
-        FrameSource::new(&config, Arc::clone(&client_view_params))?;
-    let fallback_view_params = default_stereo_view_params(
-        stream_shape.width,
-        stream_shape.height,
-        config.right_eye_shift_x_px,
-    );
+    let (mut frame_source, stream_shape) = FrameSource::new(
+        &config,
+        Arc::clone(&client_view_params),
+        Arc::clone(&latest_tracking),
+        shared_memory,
+    )?;
+    let fallback_view_params =
+        default_stereo_view_params(stream_shape.width, stream_shape.height, 0.0);
     let mut encoder = HevcEncoder::new(
         stream_shape.width,
         stream_shape.height,
         config.bitrate_bps,
         config.fps,
     )?;
+    let pace_output = config.input != BridgeInput::SharedMemory;
     let frame_interval = Duration::from_secs_f64(1.0 / f64::from(config.fps));
     let start = Instant::now();
     let mut frame_index = 0_u64;
     let mut source_frame_index = 0_u64;
     let mut empty_output_count = 0_u32;
+    let mut logged_frame_view_params = false;
+    let mut logged_global_view_params = false;
+    let mut cadence_stats = CadenceStats::new(config.fps);
+    let mut pending_frame_metadata = VecDeque::new();
+
+    log::info!("frame source and encoder ready; starting ALVR client connection");
+    server_context.start_connection();
 
     while !shutdown.load(Ordering::SeqCst)
         && config
@@ -102,32 +140,63 @@ fn main() -> Result<()> {
     {
         let force_keyframe =
             frame_index % u64::from(config.fps) == 0 || force_idr.swap(false, Ordering::SeqCst);
+        let source_start = Instant::now();
         let Some(frame) = frame_source.next_frame(frame_index, start.elapsed())? else {
             if frame_source.is_finished() {
                 log::info!("frame source finished after {source_frame_index} input frames");
                 break;
             }
+            let drained_outputs = drain_ready_outputs(
+                &mut frame_source,
+                &mut pending_frame_metadata,
+                &server_context,
+                &mut encoder,
+                start.elapsed(),
+                fallback_view_params,
+            )?;
+            if drained_outputs > 0 {
+                empty_output_count = 0;
+                cadence_stats.record_emitted(drained_outputs);
+                continue;
+            }
             thread::sleep(Duration::from_micros(500));
             continue;
         };
+        let source_elapsed = source_start.elapsed();
         source_frame_index += 1;
+        let (pixel_buffer, input_idr, frame_metadata) = frame.into_encoder_parts(
+            &client_view_params,
+            fallback_view_params,
+            stream_shape.width,
+            config.right_eye_shift_x_px,
+            &mut logged_frame_view_params,
+            &mut logged_global_view_params,
+        );
+        pending_frame_metadata.push_back(frame_metadata);
 
-        if let Some(output) =
-            encoder.encode_pixel_buffer(&frame.pixel_buffer, force_keyframe || frame.input_idr)?
-        {
+        let encode_start = Instant::now();
+        let output = encoder.encode_pixel_buffer(&pixel_buffer, force_keyframe || input_idr)?;
+        let encode_elapsed = encode_start.elapsed();
+
+        let emitted_outputs = if let Some(output) = output {
             empty_output_count = 0;
-            let view_params = client_view_params
-                .lock()
-                .expect("client view params mutex poisoned")
-                .or(frame.view_params)
-                .unwrap_or(fallback_view_params);
-            send_encoded_output(
+            send_pending_encoded_output(
+                &mut frame_source,
+                &mut pending_frame_metadata,
                 &server_context,
                 &mut encoder,
-                frame.timestamp,
                 output,
-                view_params,
+                start.elapsed(),
+                fallback_view_params,
             );
+            1 + drain_ready_outputs(
+                &mut frame_source,
+                &mut pending_frame_metadata,
+                &server_context,
+                &mut encoder,
+                start.elapsed(),
+                fallback_view_params,
+            )?
         } else {
             empty_output_count += 1;
             if empty_output_count == config.fps * 2 {
@@ -136,23 +205,85 @@ fn main() -> Result<()> {
                 );
                 empty_output_count = 0;
             }
-        }
+            0
+        };
+        cadence_stats.record(source_elapsed, encode_elapsed, emitted_outputs);
 
         frame_index += 1;
-        thread::sleep(frame_interval);
+        if pace_output {
+            let next_frame_deadline = start + frame_interval.mul_f64(frame_index as f64);
+            if let Some(sleep_duration) = next_frame_deadline.checked_duration_since(Instant::now())
+            {
+                thread::sleep(sleep_duration);
+            } else {
+                cadence_stats.record_deadline_miss(Instant::now() - next_frame_deadline);
+            }
+        }
     }
 
     for output in encoder.finish()? {
-        send_encoded_output(
+        send_pending_encoded_output(
+            &mut frame_source,
+            &mut pending_frame_metadata,
             &server_context,
             &mut encoder,
-            start.elapsed(),
             output,
+            start.elapsed(),
             fallback_view_params,
         );
     }
 
     Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn send_pending_encoded_output(
+    frame_source: &mut FrameSource,
+    pending_frame_metadata: &mut VecDeque<EncodedFrameMetadata>,
+    server_context: &ServerCoreContext,
+    encoder: &mut HevcEncoder,
+    output: EncodedOutput,
+    fallback_timestamp: Duration,
+    fallback_view_params: [ViewParams; 2],
+) {
+    let mut metadata = pending_frame_metadata.pop_front().unwrap_or_else(|| {
+        EncodedFrameMetadata::fallback(fallback_timestamp, fallback_view_params)
+    });
+    if let Some(buffer) = metadata.recycle_buffer.take() {
+        frame_source.recycle_buffer(buffer);
+    }
+    send_encoded_output(
+        server_context,
+        encoder,
+        metadata.timestamp,
+        output,
+        metadata.view_params,
+    );
+}
+
+#[cfg(target_os = "macos")]
+fn drain_ready_outputs(
+    frame_source: &mut FrameSource,
+    pending_frame_metadata: &mut VecDeque<EncodedFrameMetadata>,
+    server_context: &ServerCoreContext,
+    encoder: &mut HevcEncoder,
+    fallback_timestamp: Duration,
+    fallback_view_params: [ViewParams; 2],
+) -> Result<u64> {
+    let mut count = 0;
+    while let Some(output) = encoder.drain_output()? {
+        count += 1;
+        send_pending_encoded_output(
+            frame_source,
+            pending_frame_metadata,
+            server_context,
+            encoder,
+            output,
+            fallback_timestamp,
+            fallback_view_params,
+        );
+    }
+    Ok(count)
 }
 
 #[cfg(target_os = "macos")]
@@ -171,7 +302,114 @@ fn send_encoded_output(
         encoder.mark_config_sent();
     }
 
+    if output.is_keyframe {
+        log_view_params_contract("encoded frame contract view_params", timestamp, view_params);
+    }
+
     server_context.send_video_nal(timestamp, view_params, output.is_keyframe, output.nal_data);
+}
+
+#[cfg(target_os = "macos")]
+fn log_view_params_contract(label: &str, timestamp: Duration, view_params: [ViewParams; 2]) {
+    log::info!(
+        "{label} timestamp_ns={} pose_space=resolved-for-send left_fov=[{:.6} {:.6} {:.6} {:.6}] right_fov=[{:.6} {:.6} {:.6} {:.6}] left_pose_pos=[{:.6} {:.6} {:.6}] left_pose_orientation_xyzw=[{:.6} {:.6} {:.6} {:.6}] right_pose_pos=[{:.6} {:.6} {:.6}] right_pose_orientation_xyzw=[{:.6} {:.6} {:.6} {:.6}]",
+        timestamp.as_nanos(),
+        view_params[0].fov.left,
+        view_params[0].fov.right,
+        view_params[0].fov.up,
+        view_params[0].fov.down,
+        view_params[1].fov.left,
+        view_params[1].fov.right,
+        view_params[1].fov.up,
+        view_params[1].fov.down,
+        view_params[0].pose.position.x,
+        view_params[0].pose.position.y,
+        view_params[0].pose.position.z,
+        view_params[0].pose.orientation.x,
+        view_params[0].pose.orientation.y,
+        view_params[0].pose.orientation.z,
+        view_params[0].pose.orientation.w,
+        view_params[1].pose.position.x,
+        view_params[1].pose.position.y,
+        view_params[1].pose.position.z,
+        view_params[1].pose.orientation.x,
+        view_params[1].pose.orientation.y,
+        view_params[1].pose.orientation.z,
+        view_params[1].pose.orientation.w,
+    );
+}
+
+#[cfg(target_os = "macos")]
+struct CadenceStats {
+    interval: u64,
+    submitted: u64,
+    emitted: u64,
+    source_total: Duration,
+    source_max: Duration,
+    encode_total: Duration,
+    encode_max: Duration,
+    wall_start: Instant,
+    deadline_miss_count: u64,
+    deadline_miss_max: Duration,
+}
+
+#[cfg(target_os = "macos")]
+impl CadenceStats {
+    fn new(fps: u32) -> Self {
+        Self {
+            interval: u64::from(fps).max(1),
+            submitted: 0,
+            emitted: 0,
+            source_total: Duration::ZERO,
+            source_max: Duration::ZERO,
+            encode_total: Duration::ZERO,
+            encode_max: Duration::ZERO,
+            wall_start: Instant::now(),
+            deadline_miss_count: 0,
+            deadline_miss_max: Duration::ZERO,
+        }
+    }
+
+    fn record_deadline_miss(&mut self, miss: Duration) {
+        self.deadline_miss_count += 1;
+        self.deadline_miss_max = self.deadline_miss_max.max(miss);
+    }
+
+    fn record_emitted(&mut self, emitted: u64) {
+        self.emitted += emitted;
+    }
+
+    fn record(&mut self, source_elapsed: Duration, encode_elapsed: Duration, emitted: u64) {
+        self.submitted += 1;
+        self.emitted += emitted;
+        self.source_total += source_elapsed;
+        self.source_max = self.source_max.max(source_elapsed);
+        self.encode_total += encode_elapsed;
+        self.encode_max = self.encode_max.max(encode_elapsed);
+
+        if self.submitted % self.interval == 0 {
+            let source_avg_us = self.source_total.as_micros() / u128::from(self.interval);
+            let encode_avg_us = self.encode_total.as_micros() / u128::from(self.interval);
+            log::info!(
+                "bridge cadence frames={} emitted={} wall_ms={} timing_us source_avg={} source_max={} encode_avg={} encode_max={} deadline_misses={} deadline_miss_max_us={}",
+                self.submitted,
+                self.emitted,
+                self.wall_start.elapsed().as_millis(),
+                source_avg_us,
+                self.source_max.as_micros(),
+                encode_avg_us,
+                self.encode_max.as_micros(),
+                self.deadline_miss_count,
+                self.deadline_miss_max.as_micros()
+            );
+            self.source_total = Duration::ZERO;
+            self.source_max = Duration::ZERO;
+            self.encode_total = Duration::ZERO;
+            self.encode_max = Duration::ZERO;
+            self.deadline_miss_count = 0;
+            self.deadline_miss_max = Duration::ZERO;
+        }
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -307,13 +545,46 @@ fn horizontal_shifted_fov(fov: Fov, eye_width: u32, shift_x_px: f32) -> Fov {
 }
 
 #[cfg(target_os = "macos")]
+fn horizontally_shifted_view_params(
+    mut view_params: [ViewParams; 2],
+    eye_width: u32,
+    right_eye_shift_x_px: f32,
+) -> [ViewParams; 2] {
+    if right_eye_shift_x_px != 0.0 {
+        view_params[1].fov =
+            horizontal_shifted_fov(view_params[1].fov, eye_width, right_eye_shift_x_px);
+    }
+
+    view_params
+}
+
+#[cfg(target_os = "macos")]
+fn apply_diagnostic_eye_offset(view_params: &mut [ViewParams; 2], eye_offset_m: f32) {
+    let half_offset = eye_offset_m * 0.5;
+    view_params[0].pose.position.x = -half_offset;
+    view_params[1].pose.position.x = half_offset;
+}
+
+#[cfg(target_os = "macos")]
+fn global_view_params(hmd_pose: Pose, local_view_params: [ViewParams; 2]) -> [ViewParams; 2] {
+    local_view_params.map(|params| ViewParams {
+        pose: hmd_pose * params.pose,
+        fov: params.fov,
+    })
+}
+
+#[cfg(target_os = "macos")]
 fn event_loop(
+    server_context: Arc<ServerCoreContext>,
     events_receiver: mpsc::Receiver<ServerCoreEvent>,
     force_idr: Arc<AtomicBool>,
     shutdown: Arc<AtomicBool>,
     client_view_params: Arc<Mutex<Option<[ViewParams; 2]>>>,
+    latest_tracking: Arc<Mutex<Option<(Duration, Pose)>>>,
+    shared_memory: Option<Arc<Mutex<SharedMemory>>>,
 ) {
     let mut logged_client_view_params = false;
+    let mut logged_hmd_pose = false;
     while let Ok(event) = events_receiver.recv() {
         match event {
             ServerCoreEvent::ClientConnected(_) => {
@@ -356,7 +627,25 @@ fn event_loop(
                     .lock()
                     .expect("client view params mutex poisoned") = Some(params);
             }
-            ServerCoreEvent::Tracking { .. } => {}
+            ServerCoreEvent::Tracking { poll_timestamp } => {
+                if let Some(motion) = server_context.get_device_motion(*HEAD_ID, poll_timestamp) {
+                    *latest_tracking
+                        .lock()
+                        .expect("latest tracking mutex poisoned") =
+                        Some((poll_timestamp, motion.pose));
+                    if let Some(shared_memory) = &shared_memory {
+                        if shared_memory
+                            .lock()
+                            .expect("shared memory mutex poisoned")
+                            .publish_hmd_pose(poll_timestamp, motion.pose)
+                            && !logged_hmd_pose
+                        {
+                            log::info!("publishing AVP HMD pose to shared memory");
+                            logged_hmd_pose = true;
+                        }
+                    }
+                }
+            }
             ServerCoreEvent::Buttons(_) => {}
             ServerCoreEvent::Battery(_) => {}
             ServerCoreEvent::PlayspaceSync(_) => {}
@@ -379,12 +668,18 @@ struct BridgeConfig {
     bitrate_bps: u64,
     frame_count: Option<u64>,
     right_eye_shift_x_px: f32,
+    diagnostic_eye_offset_m: Option<f32>,
+    diagnostic_forward_z_sign: f32,
+    pattern_right_eye_shift_x_px: i32,
 }
 
 #[cfg(target_os = "macos")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BridgeInput {
     Synthetic,
+    Iosurface3d,
+    IosurfaceReprojection,
+    IosurfaceSynthetic,
     SharedMemory,
     SharedMemoryWriter,
 }
@@ -399,9 +694,77 @@ struct StreamShape {
 #[cfg(target_os = "macos")]
 struct BridgeFrame {
     pixel_buffer: Nv12PixelBuffer,
+    recycle_buffer: Option<Nv12PixelBuffer>,
     timestamp: Duration,
+    hmd_pose: Option<Pose>,
     input_idr: bool,
     view_params: Option<[ViewParams; 2]>,
+}
+
+#[cfg(target_os = "macos")]
+struct EncodedFrameMetadata {
+    timestamp: Duration,
+    view_params: [ViewParams; 2],
+    recycle_buffer: Option<Nv12PixelBuffer>,
+}
+
+#[cfg(target_os = "macos")]
+impl EncodedFrameMetadata {
+    fn fallback(timestamp: Duration, view_params: [ViewParams; 2]) -> Self {
+        Self {
+            timestamp,
+            view_params,
+            recycle_buffer: None,
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl BridgeFrame {
+    fn into_encoder_parts(
+        self,
+        client_view_params: &Arc<Mutex<Option<[ViewParams; 2]>>>,
+        fallback_view_params: [ViewParams; 2],
+        stream_width: u32,
+        right_eye_shift_x_px: f32,
+        logged_frame_view_params: &mut bool,
+        logged_global_view_params: &mut bool,
+    ) -> (Nv12PixelBuffer, bool, EncodedFrameMetadata) {
+        if self.view_params.is_some() && !*logged_frame_view_params {
+            log::info!("using frame-local view params for encoded frames");
+            *logged_frame_view_params = true;
+        }
+        if self.hmd_pose.is_some() && !*logged_global_view_params {
+            log::info!("using frame-local HMD pose/timestamp for encoded frames");
+        }
+
+        let mut view_params = self
+            .view_params
+            .or_else(|| {
+                *client_view_params
+                    .lock()
+                    .expect("client view params mutex poisoned")
+            })
+            .unwrap_or(fallback_view_params);
+        view_params =
+            horizontally_shifted_view_params(view_params, stream_width / 2, right_eye_shift_x_px);
+
+        if let Some(hmd_pose) = self.hmd_pose {
+            view_params = global_view_params(hmd_pose, view_params);
+            if !*logged_global_view_params {
+                log::info!("using AVP HMD pose composed with local eye params for encoded frames");
+                *logged_global_view_params = true;
+            }
+        }
+
+        let metadata = EncodedFrameMetadata {
+            timestamp: self.timestamp,
+            view_params,
+            recycle_buffer: self.recycle_buffer,
+        };
+
+        (self.pixel_buffer, self.input_idr, metadata)
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -435,6 +798,20 @@ impl BridgeConfig {
         );
         anyhow::ensure!(fps > 0, "ALVR_BRIDGE_FPS must be greater than 0");
 
+        let diagnostic_eye_offset_m = if matches!(
+            input,
+            BridgeInput::Iosurface3d | BridgeInput::IosurfaceReprojection
+        ) {
+            env_optional_f32("ALVR_BRIDGE_DIAGNOSTIC_EYE_OFFSET_M")?
+        } else {
+            if env::var_os("ALVR_BRIDGE_DIAGNOSTIC_EYE_OFFSET_M").is_some() {
+                log::warn!(
+                    "ignoring ALVR_BRIDGE_DIAGNOSTIC_EYE_OFFSET_M because input is not iosurface-3d or iosurface-reprojection"
+                );
+            }
+            None
+        };
+
         Ok(Self {
             root,
             input,
@@ -444,6 +821,9 @@ impl BridgeConfig {
             bitrate_bps: env_u64("ALVR_BRIDGE_BITRATE_BPS", 20_000_000)?,
             frame_count: env_optional_u64("ALVR_BRIDGE_FRAMES")?,
             right_eye_shift_x_px: env_f32("ALVR_BRIDGE_RIGHT_EYE_SHIFT_X_PX", 0.0)?,
+            diagnostic_eye_offset_m,
+            diagnostic_forward_z_sign: env_f32("ALVR_BRIDGE_DIAGNOSTIC_FORWARD_Z_SIGN", -1.0)?,
+            pattern_right_eye_shift_x_px: env_i32("ALVR_BRIDGE_PATTERN_RIGHT_EYE_SHIFT_X_PX", 0)?,
         })
     }
 }
@@ -454,13 +834,37 @@ enum FrameSource {
         source: SyntheticFrameSource,
         converter: Nv12Frame,
     },
+    IosurfaceSynthetic {
+        source: IosurfaceSyntheticFrameSource,
+    },
+    IosurfaceReprojection {
+        source: IosurfaceSyntheticFrameSource,
+        client_view_params: Arc<Mutex<Option<[ViewParams; 2]>>>,
+        latest_tracking: Arc<Mutex<Option<(Duration, Pose)>>>,
+        fallback_view_params: [ViewParams; 2],
+        diagnostic_eye_offset_m: Option<f32>,
+        logged_diagnostic_eye_offset: bool,
+        logged_tracking: bool,
+    },
+    Iosurface3d {
+        source: Iosurface3dFrameSource,
+        client_view_params: Arc<Mutex<Option<[ViewParams; 2]>>>,
+        latest_tracking: Arc<Mutex<Option<(Duration, Pose)>>>,
+        fallback_view_params: [ViewParams; 2],
+        right_eye_shift_x_px: f32,
+        diagnostic_eye_offset_m: Option<f32>,
+        diagnostic_forward_z_sign: f32,
+        logged_diagnostic_eye_offset: bool,
+    },
     SharedMemory {
-        shm: SharedMemory,
+        shm: Arc<Mutex<SharedMemory>>,
         converter: Nv12Frame,
         expected_width: u32,
         expected_height: u32,
         last_log: Instant,
         client_view_params: Arc<Mutex<Option<[ViewParams; 2]>>>,
+        latest_tracking: Arc<Mutex<Option<(Duration, Pose)>>>,
+        logged_tracking_timestamp: bool,
     },
 }
 
@@ -469,6 +873,8 @@ impl FrameSource {
     fn new(
         config: &BridgeConfig,
         client_view_params: Arc<Mutex<Option<[ViewParams; 2]>>>,
+        latest_tracking: Arc<Mutex<Option<(Duration, Pose)>>>,
+        shared_memory: Option<Arc<Mutex<SharedMemory>>>,
     ) -> Result<(Self, StreamShape)> {
         match config.input {
             BridgeInput::Synthetic => Ok((
@@ -481,11 +887,65 @@ impl FrameSource {
                     height: config.height,
                 },
             )),
+            BridgeInput::IosurfaceSynthetic => Ok((
+                Self::IosurfaceSynthetic {
+                    source: IosurfaceSyntheticFrameSource::new(
+                        config.width,
+                        config.height,
+                        config.pattern_right_eye_shift_x_px,
+                    )?,
+                },
+                StreamShape {
+                    width: config.width,
+                    height: config.height,
+                },
+            )),
+            BridgeInput::IosurfaceReprojection => Ok((
+                Self::IosurfaceReprojection {
+                    source: IosurfaceSyntheticFrameSource::new(config.width, config.height, 0)?,
+                    client_view_params,
+                    latest_tracking,
+                    fallback_view_params: default_stereo_view_params(
+                        config.width,
+                        config.height,
+                        0.0,
+                    ),
+                    diagnostic_eye_offset_m: config.diagnostic_eye_offset_m,
+                    logged_diagnostic_eye_offset: false,
+                    logged_tracking: false,
+                },
+                StreamShape {
+                    width: config.width,
+                    height: config.height,
+                },
+            )),
+            BridgeInput::Iosurface3d => Ok((
+                Self::Iosurface3d {
+                    source: Iosurface3dFrameSource::new(config.width, config.height)?,
+                    client_view_params,
+                    latest_tracking,
+                    fallback_view_params: default_stereo_view_params(
+                        config.width,
+                        config.height,
+                        0.0,
+                    ),
+                    right_eye_shift_x_px: config.right_eye_shift_x_px,
+                    diagnostic_eye_offset_m: config.diagnostic_eye_offset_m,
+                    diagnostic_forward_z_sign: config.diagnostic_forward_z_sign,
+                    logged_diagnostic_eye_offset: false,
+                },
+                StreamShape {
+                    width: config.width,
+                    height: config.height,
+                },
+            )),
             BridgeInput::SharedMemory => {
-                let mut shm = SharedMemory::create()?;
+                let shm = shared_memory.context("shared-memory input requires shared mapping")?;
                 log::info!("waiting for shared-memory producer config");
-                let (width, height, format) =
-                    wait_for_shared_memory_config(&mut shm, &client_view_params)?;
+                let (width, height, format) = wait_for_shared_memory_config(
+                    &mut shm.lock().expect("shared memory mutex poisoned"),
+                    &client_view_params,
+                )?;
                 log::info!("shared memory configured: {width}x{height} format=0x{format:x}");
 
                 Ok((
@@ -496,6 +956,8 @@ impl FrameSource {
                         expected_height: height,
                         last_log: Instant::now(),
                         client_view_params,
+                        latest_tracking,
+                        logged_tracking_timestamp: false,
                     },
                     StreamShape { width, height },
                 ))
@@ -514,9 +976,141 @@ impl FrameSource {
                 let (y, uv) = source.frame(frame_index);
                 Ok(Some(BridgeFrame {
                     pixel_buffer: converter.pixel_buffer_from_nv12_planes(y, uv)?,
+                    recycle_buffer: None,
                     timestamp: fallback_timestamp,
+                    hmd_pose: None,
                     input_idr: false,
                     view_params: None,
+                }))
+            }
+            Self::IosurfaceSynthetic { source } => {
+                let Some(frame) = source.frame(frame_index)? else {
+                    return Ok(None);
+                };
+                if frame_index < 10 || frame_index % 120 == 0 {
+                    log::info!(
+                        "filled IOSurface synthetic frame {frame_index} timing_us fill={}",
+                        frame.fill_elapsed.as_micros()
+                    );
+                }
+                Ok(Some(BridgeFrame {
+                    pixel_buffer: frame.pixel_buffer,
+                    recycle_buffer: Some(frame.recycle_buffer),
+                    timestamp: fallback_timestamp,
+                    hmd_pose: None,
+                    input_idr: false,
+                    view_params: None,
+                }))
+            }
+            Self::IosurfaceReprojection {
+                source,
+                client_view_params,
+                latest_tracking,
+                fallback_view_params,
+                diagnostic_eye_offset_m,
+                logged_diagnostic_eye_offset,
+                logged_tracking,
+            } => {
+                let Some(frame) = source.frame(frame_index)? else {
+                    return Ok(None);
+                };
+                let mut local_view_params = client_view_params
+                    .lock()
+                    .expect("client view params mutex poisoned")
+                    .unwrap_or(*fallback_view_params);
+                if let Some(eye_offset_m) = *diagnostic_eye_offset_m {
+                    apply_diagnostic_eye_offset(&mut local_view_params, eye_offset_m);
+                    if !*logged_diagnostic_eye_offset {
+                        log::info!(
+                            "using diagnostic reprojection eye offset {:.4}m for iosurface-reprojection view params",
+                            eye_offset_m
+                        );
+                        *logged_diagnostic_eye_offset = true;
+                    }
+                }
+                let tracking = *latest_tracking
+                    .lock()
+                    .expect("latest tracking mutex poisoned");
+                let (timestamp, hmd_pose, has_tracking) = tracking
+                    .map(|(timestamp, pose)| (timestamp, pose, true))
+                    .unwrap_or((fallback_timestamp, Pose::IDENTITY, false));
+                if has_tracking && !*logged_tracking {
+                    log::info!("using AVP HMD pose/timestamp for iosurface-reprojection frames");
+                    *logged_tracking = true;
+                }
+                if frame_index < 10 || frame_index % 120 == 0 {
+                    log::info!(
+                        "filled IOSurface reprojection frame {frame_index} timing_us fill={} tracking={has_tracking}",
+                        frame.fill_elapsed.as_micros()
+                    );
+                }
+                Ok(Some(BridgeFrame {
+                    pixel_buffer: frame.pixel_buffer,
+                    recycle_buffer: Some(frame.recycle_buffer),
+                    timestamp,
+                    hmd_pose: has_tracking.then_some(hmd_pose),
+                    input_idr: false,
+                    view_params: Some(local_view_params),
+                }))
+            }
+            Self::Iosurface3d {
+                source,
+                client_view_params,
+                latest_tracking,
+                fallback_view_params,
+                right_eye_shift_x_px,
+                diagnostic_eye_offset_m,
+                diagnostic_forward_z_sign,
+                logged_diagnostic_eye_offset,
+            } => {
+                let mut local_view_params = client_view_params
+                    .lock()
+                    .expect("client view params mutex poisoned")
+                    .unwrap_or(*fallback_view_params);
+                if let Some(eye_offset_m) = *diagnostic_eye_offset_m {
+                    apply_diagnostic_eye_offset(&mut local_view_params, eye_offset_m);
+                    if !*logged_diagnostic_eye_offset {
+                        log::info!(
+                            "using diagnostic 3D eye offset {:.4}m for iosurface-3d view params",
+                            eye_offset_m
+                        );
+                        *logged_diagnostic_eye_offset = true;
+                    }
+                }
+                let render_view_params = horizontally_shifted_view_params(
+                    local_view_params,
+                    source.width() / 2,
+                    *right_eye_shift_x_px,
+                );
+                let tracking = *latest_tracking
+                    .lock()
+                    .expect("latest tracking mutex poisoned");
+                let (timestamp, hmd_pose, has_tracking) = tracking
+                    .map(|(timestamp, pose)| (timestamp, pose, true))
+                    .unwrap_or((fallback_timestamp, Pose::IDENTITY, false));
+                let Some(frame) = source.frame(
+                    frame_index,
+                    hmd_pose,
+                    render_view_params,
+                    *diagnostic_forward_z_sign,
+                    has_tracking,
+                )?
+                else {
+                    return Ok(None);
+                };
+                if frame_index < 10 || frame_index % 120 == 0 {
+                    log::info!(
+                        "filled IOSurface 3D frame {frame_index} timing_us fill={} tracking={has_tracking}",
+                        frame.fill_elapsed.as_micros()
+                    );
+                }
+                Ok(Some(BridgeFrame {
+                    pixel_buffer: frame.pixel_buffer,
+                    recycle_buffer: Some(frame.recycle_buffer),
+                    timestamp,
+                    hmd_pose: has_tracking.then_some(hmd_pose),
+                    input_idr: false,
+                    view_params: Some(local_view_params),
                 }))
             }
             Self::SharedMemory {
@@ -526,12 +1120,15 @@ impl FrameSource {
                 expected_height,
                 last_log,
                 client_view_params,
+                latest_tracking,
+                logged_tracking_timestamp,
             } => {
+                let mut shm = shm.lock().expect("shared memory mutex poisoned");
                 if shm.is_shutdown() {
                     return Ok(None);
                 }
                 shm.refresh_bridge_heartbeat();
-                publish_client_view_params(shm, client_view_params);
+                publish_client_view_params(&mut shm, client_view_params);
 
                 if let Some((width, height, format)) = shm.config()
                     && last_log.elapsed() > Duration::from_secs(1)
@@ -580,7 +1177,24 @@ impl FrameSource {
                     frame.header.stride,
                 )?;
                 let convert_us = convert_start.elapsed().as_micros() as u64;
-                let timestamp = Duration::from_nanos(frame.header.timestamp_ns);
+                let producer_timestamp = Duration::from_nanos(frame.header.timestamp_ns);
+                let frame_pose = SharedMemory::frame_pose(&frame.header);
+                let tracking = *latest_tracking
+                    .lock()
+                    .expect("latest tracking mutex poisoned");
+                let (hmd_pose, timestamp) = if let Some(frame_pose) = frame_pose {
+                    (Some(frame_pose), producer_timestamp)
+                } else if let Some((timestamp, pose)) = tracking {
+                    (Some(pose), timestamp)
+                } else {
+                    (None, producer_timestamp)
+                };
+                if timestamp != producer_timestamp && !*logged_tracking_timestamp {
+                    log::info!(
+                        "using latest AVP tracking timestamp for shared-memory encoded frames"
+                    );
+                    *logged_tracking_timestamp = true;
+                }
                 let input_idr = frame.header.is_idr != 0;
                 let buffer_index = frame.buffer_index;
                 let frame_number = frame.header.frame_number;
@@ -605,7 +1219,9 @@ impl FrameSource {
 
                 Ok(Some(BridgeFrame {
                     pixel_buffer,
+                    recycle_buffer: None,
                     timestamp,
+                    hmd_pose,
                     input_idr,
                     view_params,
                 }))
@@ -616,7 +1232,22 @@ impl FrameSource {
     fn is_finished(&self) -> bool {
         match self {
             Self::Synthetic { .. } => false,
-            Self::SharedMemory { shm, .. } => shm.is_shutdown(),
+            Self::IosurfaceSynthetic { .. } => false,
+            Self::IosurfaceReprojection { .. } => false,
+            Self::Iosurface3d { .. } => false,
+            Self::SharedMemory { shm, .. } => shm
+                .lock()
+                .expect("shared memory mutex poisoned")
+                .is_shutdown(),
+        }
+    }
+
+    fn recycle_buffer(&mut self, buffer: Nv12PixelBuffer) {
+        match self {
+            Self::IosurfaceSynthetic { source, .. } => source.recycle(buffer),
+            Self::IosurfaceReprojection { source, .. } => source.recycle(buffer),
+            Self::Iosurface3d { source, .. } => source.recycle(buffer),
+            Self::Synthetic { .. } | Self::SharedMemory { .. } => {}
         }
     }
 }
@@ -743,6 +1374,13 @@ fn env_input() -> Result<BridgeInput> {
         .as_str()
     {
         "synthetic" => Ok(BridgeInput::Synthetic),
+        "iosurface-3d" | "iosurface_3d" | "gpu-3d" | "gpu_3d" => Ok(BridgeInput::Iosurface3d),
+        "iosurface-reprojection" | "iosurface_reprojection" | "reprojection" => {
+            Ok(BridgeInput::IosurfaceReprojection)
+        }
+        "iosurface-synthetic" | "iosurface_synthetic" | "gpu-synthetic" | "gpu_synthetic" => {
+            Ok(BridgeInput::IosurfaceSynthetic)
+        }
         "shared-memory" | "shared_memory" | "shm" => Ok(BridgeInput::SharedMemory),
         "shared-memory-writer" | "shared_memory_writer" | "shm-writer" => {
             Ok(BridgeInput::SharedMemoryWriter)
@@ -760,6 +1398,25 @@ fn env_u64(name: &str, default: u64) -> Result<u64> {
 
 #[cfg(target_os = "macos")]
 fn env_f32(name: &str, default: f32) -> Result<f32> {
+    env::var(name)
+        .map(|value| value.parse().with_context(|| format!("invalid {name}")))
+        .unwrap_or(Ok(default))
+}
+
+#[cfg(target_os = "macos")]
+fn env_optional_f32(name: &str) -> Result<Option<f32>> {
+    env::var(name)
+        .map(|value| {
+            value
+                .parse()
+                .map(Some)
+                .with_context(|| format!("invalid {name}"))
+        })
+        .unwrap_or(Ok(None))
+}
+
+#[cfg(target_os = "macos")]
+fn env_i32(name: &str, default: i32) -> Result<i32> {
     env::var(name)
         .map(|value| value.parse().with_context(|| format!("invalid {name}")))
         .unwrap_or(Ok(default))

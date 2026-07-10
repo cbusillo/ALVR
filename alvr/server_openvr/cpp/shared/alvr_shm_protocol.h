@@ -5,7 +5,7 @@
 
 #define ALVR_SHM_PATH "/tmp/alvr_frame_buffer.shm"
 #define ALVR_SHM_MAGIC 0x414C5652
-#define ALVR_SHM_VERSION 2
+#define ALVR_SHM_VERSION 5
 
 #define ALVR_MAX_WIDTH 4096
 #define ALVR_MAX_HEIGHT 2048
@@ -60,13 +60,21 @@ typedef struct {
     volatile uint32_t view_config_set;
     float view_fov[2][4];
     float view_eye_x_m[2];
-    uint32_t view_padding;
+    volatile uint32_t hmd_pose_set;
+    volatile uint32_t hmd_pose_sequence;
+    volatile uint32_t frame_pose_sequence;
+    uint64_t hmd_pose_timestamp_ns;
+    uint64_t frame_pose_timestamp_ns;
+    float frame_pose[3][4];
+    float hmd_pose[3][4];
     AlvrFrameHeader frame_headers[ALVR_NUM_BUFFERS];
 } AlvrSharedMemory;
 
 #ifdef __cplusplus
 static_assert(offsetof(AlvrSharedMemory, write_sequence) == 32, "write_sequence ABI offset");
-static_assert(offsetof(AlvrSharedMemory, frame_headers) == 136, "frame_headers ABI offset");
+static_assert(offsetof(AlvrSharedMemory, hmd_pose_set) == 132, "hmd pose flag ABI offset");
+static_assert(offsetof(AlvrSharedMemory, hmd_pose_timestamp_ns) == 144, "hmd pose timestamp ABI offset");
+static_assert(offsetof(AlvrSharedMemory, frame_headers) == 256, "frame_headers ABI offset");
 static_assert(offsetof(AlvrSharedMemory, view_config_set) == 88, "view config ABI offset");
 static_assert(offsetof(AlvrFrameHeader, producer_publish_wall_ns) == 88, "frame timing ABI offset");
 static_assert(sizeof(AlvrFrameHeader) == 128, "frame header ABI size");

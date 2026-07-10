@@ -1,6 +1,6 @@
 use alvr_common::{
     Fov, Pose, ViewParams,
-    glam::{Quat, Vec3},
+    glam::{Mat4, Quat, Vec3},
 };
 use anyhow::{Context, Result, bail};
 use memmap2::MmapMut;
@@ -18,7 +18,7 @@ use std::os::unix::fs::OpenOptionsExt;
 
 pub const SHM_PATH: &str = "/tmp/alvr_frame_buffer.shm";
 pub const SHM_MAGIC: u32 = 0x414C5652;
-pub const SHM_VERSION: u32 = 2;
+pub const SHM_VERSION: u32 = 5;
 pub const MAX_WIDTH: u32 = 4096;
 pub const MAX_HEIGHT: u32 = 2048;
 pub const BYTES_PER_PIXEL: u32 = 4;
@@ -67,6 +67,7 @@ pub struct FrameHeader {
     pub timestamp_ns: u64,
     pub frame_number: u64,
     pub is_idr: u8,
+    pub pose: [[f32; 4]; 3],
     pub producer_publish_wall_ns: u64,
     pub producer_capture_total_us: u32,
     pub producer_copy_resource_us: u32,
@@ -87,6 +88,7 @@ impl FrameHeader {
             timestamp_ns: raw.timestamp_ns,
             frame_number: raw.frame_number,
             is_idr: raw.is_idr,
+            pose: raw.pose,
             producer_publish_wall_ns: raw.producer_publish_wall_ns,
             producer_capture_total_us: raw.producer_capture_total_us,
             producer_copy_resource_us: raw.producer_copy_resource_us,
@@ -120,13 +122,21 @@ pub struct SharedMemoryHeader {
     pub view_config_set: AtomicU32,
     pub view_fov: [[f32; 4]; 2],
     pub view_eye_x_m: [f32; 2],
-    pub view_padding: u32,
+    pub hmd_pose_set: AtomicU32,
+    pub hmd_pose_sequence: AtomicU32,
+    pub frame_pose_sequence: AtomicU32,
+    pub hmd_pose_timestamp_ns: u64,
+    pub frame_pose_timestamp_ns: u64,
+    pub frame_pose: [[f32; 4]; 3],
+    pub hmd_pose: [[f32; 4]; 3],
     pub frame_headers: [FrameHeaderRaw; NUM_BUFFERS],
 }
 
 const _: () = {
     assert!(mem::offset_of!(SharedMemoryHeader, write_sequence) == 32);
-    assert!(mem::offset_of!(SharedMemoryHeader, frame_headers) == 136);
+    assert!(mem::offset_of!(SharedMemoryHeader, hmd_pose_set) == 132);
+    assert!(mem::offset_of!(SharedMemoryHeader, hmd_pose_timestamp_ns) == 144);
+    assert!(mem::offset_of!(SharedMemoryHeader, frame_headers) == 256);
     assert!(mem::offset_of!(SharedMemoryHeader, view_config_set) == 88);
     assert!(mem::offset_of!(FrameHeaderRaw, producer_publish_wall_ns) == 88);
     assert!(mem::size_of::<FrameHeaderRaw>() == 128);
@@ -306,6 +316,40 @@ impl SharedMemory {
         }
         header.view_config_set.store(1, Ordering::Release);
         true
+    }
+
+    pub fn publish_hmd_pose(&mut self, timestamp: Duration, pose: Pose) -> bool {
+        if !valid_pose(pose) {
+            return false;
+        }
+
+        let matrix = pose_to_matrix34(pose);
+        let header = self.header_mut();
+        let sequence = header.hmd_pose_sequence.load(Ordering::Relaxed);
+        let write_sequence = if sequence % 2 == 0 {
+            sequence.wrapping_add(1)
+        } else {
+            sequence
+        };
+        header
+            .hmd_pose_sequence
+            .store(write_sequence, Ordering::Release);
+        header.hmd_pose = matrix;
+        header.hmd_pose_timestamp_ns = timestamp.as_nanos() as u64;
+        header
+            .hmd_pose_sequence
+            .store(write_sequence.wrapping_add(1), Ordering::Release);
+        header.hmd_pose_set.store(1, Ordering::Release);
+        true
+    }
+
+    pub fn frame_pose(header: &FrameHeader) -> Option<Pose> {
+        if !valid_pose_matrix(header.pose) {
+            return None;
+        }
+
+        let pose = matrix34_to_pose(header.pose)?;
+        valid_pose(pose).then_some(pose)
     }
 
     pub fn validate_config(width: u32, height: u32, format: u32) -> Result<()> {
@@ -504,11 +548,68 @@ fn valid_fov_angle(value: f32) -> Option<f32> {
 
 pub(crate) fn valid_view_params(params: [ViewParams; 2]) -> bool {
     params.iter().all(|params| {
-        params.pose.position.x.is_finite()
+        valid_pose(params.pose)
             && params.pose.position.x.abs() <= 0.2
             && params.fov.left < -0.001
             && params.fov.right > 0.001
             && params.fov.up > 0.001
             && params.fov.down < -0.001
     })
+}
+
+fn valid_pose(pose: Pose) -> bool {
+    let orientation_len = pose.orientation.length_squared();
+    pose.position.is_finite()
+        && pose.orientation.is_finite()
+        && (0.5..=1.5).contains(&orientation_len)
+}
+
+fn valid_pose_matrix(matrix: [[f32; 4]; 3]) -> bool {
+    if !matrix
+        .iter()
+        .flatten()
+        .all(|value| value.is_finite() && value.abs() <= 1000.0)
+    {
+        return false;
+    }
+
+    let rows = [
+        Vec3::new(matrix[0][0], matrix[0][1], matrix[0][2]),
+        Vec3::new(matrix[1][0], matrix[1][1], matrix[1][2]),
+        Vec3::new(matrix[2][0], matrix[2][1], matrix[2][2]),
+    ];
+
+    rows.iter()
+        .all(|row| (0.5..=1.5).contains(&row.length_squared()))
+        && rows[0].dot(rows[1]).abs() <= 0.2
+        && rows[0].dot(rows[2]).abs() <= 0.2
+        && rows[1].dot(rows[2]).abs() <= 0.2
+}
+
+fn matrix34_to_pose(matrix: [[f32; 4]; 3]) -> Option<Pose> {
+    if !valid_pose_matrix(matrix) {
+        return None;
+    }
+
+    let cols = [
+        [matrix[0][0], matrix[1][0], matrix[2][0], 0.0],
+        [matrix[0][1], matrix[1][1], matrix[2][1], 0.0],
+        [matrix[0][2], matrix[1][2], matrix[2][2], 0.0],
+        [matrix[0][3], matrix[1][3], matrix[2][3], 1.0],
+    ];
+    let transform = Mat4::from_cols_array_2d(&cols);
+    let (_scale, orientation, position) = transform.to_scale_rotation_translation();
+    Some(Pose {
+        orientation,
+        position,
+    })
+}
+
+fn pose_to_matrix34(pose: Pose) -> [[f32; 4]; 3] {
+    let cols = Mat4::from_rotation_translation(pose.orientation, pose.position).to_cols_array_2d();
+    [
+        [cols[0][0], cols[1][0], cols[2][0], cols[3][0]],
+        [cols[0][1], cols[1][1], cols[2][1], cols[3][1]],
+        [cols[0][2], cols[1][2], cols[2][2], cols[3][2]],
+    ]
 }

@@ -884,6 +884,7 @@ fn connection_pipeline(
         let ctx = Arc::clone(&ctx);
         let client_hostname = client_hostname.clone();
         move || {
+            let mut stream_send_sequence = 0_u64;
             while is_streaming(&client_hostname) {
                 let VideoPacket {
                     mut header,
@@ -899,9 +900,22 @@ fn connection_pipeline(
                     .unrecenter_view_params(&mut header.global_view_params);
 
                 // todo: use get_buffer and make encoder write to socket buffers directly to avoid copy
-                video_sender
-                    .send_header_with_payload(&header, &payload)
-                    .ok();
+                stream_send_sequence += 1;
+                let timestamp_ns = header.timestamp.as_nanos();
+                let is_idr = header.is_idr;
+                let payload_len = payload.len();
+                match video_sender.send_header_with_payload(&header, &payload) {
+                    Ok(()) => {
+                        if is_idr || stream_send_sequence <= 5 || stream_send_sequence % 90 == 0 {
+                            info!(
+                                "sent video stream packet seq={stream_send_sequence} timestamp_ns={timestamp_ns} idr={is_idr} bytes={payload_len}"
+                            );
+                        }
+                    }
+                    Err(e) => warn!(
+                        "Failed to send video stream packet seq={stream_send_sequence} timestamp_ns={timestamp_ns} idr={is_idr} bytes={payload_len}: {e:?}"
+                    ),
+                }
             }
         }
     });

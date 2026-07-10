@@ -80,6 +80,10 @@ impl HevcEncoder {
         Ok(outputs)
     }
 
+    pub fn drain_output(&mut self) -> Result<Option<EncodedOutput>> {
+        self.drain_one_frame()
+    }
+
     pub fn config_sent(&self) -> bool {
         self.config_sent
     }

@@ -7,7 +7,7 @@ pub use stream::*;
 
 use alvr_common::{
     DeviceMotion, Fov, Pose,
-    glam::{Mat4, UVec2, Vec4},
+    glam::{Mat4, UVec2},
 };
 use glow::{self as gl, HasContext};
 use khronos_egl as egl;
@@ -60,26 +60,7 @@ macro_rules! ck {
 pub(crate) use ck;
 
 fn projection_from_fov(fov: Fov) -> Mat4 {
-    const NEAR: f32 = 0.1;
-
-    let tanl = f32::tan(fov.left);
-    let tanr = f32::tan(fov.right);
-    let tanu = f32::tan(fov.up);
-    let tand = f32::tan(fov.down);
-    let a = 2.0 / (tanr - tanl);
-    let b = 2.0 / (tanu - tand);
-    let c = (tanr + tanl) / (tanr - tanl);
-    let d = (tanu + tand) / (tanu - tand);
-
-    // note: for wgpu compatibility, the b and d components should be flipped. Maybe a bug in the
-    // viewport handling in wgpu?
-    Mat4::from_cols(
-        Vec4::new(a, 0.0, c, 0.0),
-        Vec4::new(0.0, -b, -d, 0.0),
-        Vec4::new(0.0, 0.0, -1.0, -NEAR),
-        Vec4::new(0.0, 0.0, -1.0, 0.0),
-    )
-    .transpose()
+    fov.to_wgpu_projection_matrix()
 }
 
 pub fn choose_swapchain_format(supported_formats: &[u32], enable_hdr: bool) -> u32 {

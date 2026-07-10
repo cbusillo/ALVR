@@ -1,4 +1,4 @@
-use glam::{Quat, Vec3};
+use glam::{Mat4, Quat, Vec3, Vec4};
 use serde::{Deserialize, Serialize};
 use std::{ops::Mul, time::Duration};
 
@@ -18,6 +18,29 @@ impl Fov {
         up: 1.0,
         down: -1.0,
     };
+
+    pub fn to_wgpu_projection_matrix(self) -> Mat4 {
+        const NEAR: f32 = 0.1;
+
+        let tanl = f32::tan(self.left);
+        let tanr = f32::tan(self.right);
+        let tanu = f32::tan(self.up);
+        let tand = f32::tan(self.down);
+        let a = 2.0 / (tanr - tanl);
+        let b = 2.0 / (tanu - tand);
+        let c = (tanr + tanl) / (tanr - tanl);
+        let d = (tanu + tand) / (tanu - tand);
+
+        // note: for wgpu compatibility, the b and d components should be flipped. Maybe a bug in
+        // the viewport handling in wgpu?
+        Mat4::from_cols(
+            Vec4::new(a, 0.0, c, 0.0),
+            Vec4::new(0.0, -b, -d, 0.0),
+            Vec4::new(0.0, 0.0, -1.0, -NEAR),
+            Vec4::new(0.0, 0.0, -1.0, 0.0),
+        )
+        .transpose()
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, Default, Debug)]
