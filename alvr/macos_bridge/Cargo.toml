@@ -1,0 +1,27 @@
+[package]
+name = "alvr_macos_bridge"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[lib]
+name = "alvr_macos_bridge"
+path = "src/lib.rs"
+
+[[bin]]
+name = "alvr_macos_bridge"
+path = "src/main.rs"
+
+[dependencies]
+alvr_common.workspace = true
+
+anyhow = "1"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+alvr_filesystem.workspace = true
+alvr_server_core.workspace = true
+alvr_session.workspace = true
+
+shiguredo_video_toolbox = "2026.1.1"
