@@ -1,5 +1,7 @@
 use alvr_common::ViewParams;
-use std::{collections::VecDeque, error::Error, fmt, time::Duration};
+#[cfg(any(target_os = "macos", test))]
+use std::collections::VecDeque;
+use std::{error::Error, fmt, time::Duration};
 
 #[derive(Clone, Copy)]
 pub struct FrameMetadata {
@@ -55,23 +57,27 @@ impl fmt::Display for ContractError {
 impl Error for ContractError {}
 
 #[derive(Clone, Copy)]
+#[cfg(any(target_os = "macos", test))]
 struct FrameOrderKey {
     frame_id: u64,
     video_timestamp: Duration,
     pose_timestamp: Duration,
 }
 
+#[cfg(any(target_os = "macos", test))]
 pub(crate) struct PendingSubmission<T> {
     pub lease_id: SurfaceLeaseId,
     pub metadata: FrameMetadata,
     pub resource: T,
 }
 
+#[cfg(any(target_os = "macos", test))]
 pub(crate) struct OrderedPending<T> {
     last_submission: Option<FrameOrderKey>,
     queue: VecDeque<PendingSubmission<T>>,
 }
 
+#[cfg(any(target_os = "macos", test))]
 impl<T> Default for OrderedPending<T> {
     fn default() -> Self {
         Self {
@@ -81,6 +87,7 @@ impl<T> Default for OrderedPending<T> {
     }
 }
 
+#[cfg(any(target_os = "macos", test))]
 impl<T> OrderedPending<T> {
     pub fn validate(&self, metadata: &FrameMetadata) -> Result<(), ContractError> {
         let Some(previous) = self.last_submission else {

@@ -387,6 +387,7 @@ dependencies = [
  "alvr_server_core",
  "alvr_session",
  "anyhow",
+ "serde_json",
  "shiguredo_video_toolbox",
 ]
 

@@ -145,8 +145,14 @@ unsafe impl Send for NativeSurface {}
 
 impl NativeSurface {
     fn new(width: u32, height: u32) -> Result<Self> {
-        ensure!(width > 0 && width % 2 == 0, "NV12 width must be even");
-        ensure!(height > 0 && height % 2 == 0, "NV12 height must be even");
+        ensure!(
+            width > 0 && width.is_multiple_of(2),
+            "NV12 width must be even"
+        );
+        ensure!(
+            height > 0 && height.is_multiple_of(2),
+            "NV12 height must be even"
+        );
 
         let iosurface_properties = CfObject::dictionary(&[], &[])?;
         let keys = unsafe {

@@ -65,11 +65,11 @@ pub struct NativeHevcEncoder {
 impl NativeHevcEncoder {
     pub fn new(config: NativeHevcEncoderConfig) -> Result<(Self, HardwareEncoderSupport)> {
         ensure!(
-            config.width > 0 && config.width % 2 == 0,
+            config.width > 0 && config.width.is_multiple_of(2),
             "HEVC width must be even"
         );
         ensure!(
-            config.height > 0 && config.height % 2 == 0,
+            config.height > 0 && config.height.is_multiple_of(2),
             "HEVC height must be even"
         );
         ensure!(config.fps > 0, "HEVC FPS must be greater than zero");

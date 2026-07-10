@@ -16,6 +16,9 @@ acquire lease
 The contract requires strictly increasing frame IDs and video timestamps.
 Pose timestamps are carried separately and must be nondecreasing, so a producer
 can pair a frame with the tracking sample used to build its global view params.
+ALVR tracking timestamps are normalized into the probe's run-relative monotonic
+clock; reusing one tracking sample therefore reuses its pose timestamp without
+mixing the server-uptime and video clock domains.
 Frame reordering is disabled and encoded outputs are matched to submitted leases
 in FIFO order.
 
@@ -38,10 +41,11 @@ ALVR_BRIDGE_TELEMETRY_INTERVAL=90 \
 cargo run -p alvr_macos_bridge --release
 ```
 
-Each cadence line reports submitted and encoded totals, source-write and encode
-submission timing, deadline misses, and the minimum number of available leases.
-The final line succeeds only if every submitted frame was emitted and every
-lease returned to the pool.
+Each cadence line reports submitted, encoded, and ALVR-sent totals, source-write
+and encode submission timing, deadline misses, and the minimum number of
+available leases. The final line succeeds only if every submitted frame was
+emitted and every lease returned to the pool. In connect mode, it also requires
+a real client connection and at least one frame handed to ALVR transport.
 
 ## Optional ALVR transport
 
@@ -57,8 +61,14 @@ cargo run -p alvr_macos_bridge --release
 ```
 
 Connect mode writes ALVR's `session.json`, `session_log.txt`, and
-`crash_log.txt` beneath `ALVR_BRIDGE_ROOT`. Removing that probe root cleans up
-the generated files.
+`crash_log.txt` beneath `ALVR_BRIDGE_ROOT`. Because this contract emits HEVC
+only, startup preserves the rest of that dedicated session and sets
+`session_settings.video.preferred_codec.variant` to `Hevc` before ALVR loads the
+file. Use a dedicated root that is not being written by a running ALVR dashboard.
+A fresh or materially changed session may use the first client handshake to
+persist upstream restart settings; without an ALVR dashboard process, rerun the
+same bounded command once. Connect mode succeeds only after it observes a real
+`ClientConnected` event. Removing that probe root cleans up the generated files.
 
 ## Deliberate limits
 

@@ -51,11 +51,11 @@ impl ProbeConfig {
 
     fn validate(&self) -> Result<()> {
         ensure!(
-            self.width > 0 && self.width % 4 == 0,
+            self.width > 0 && self.width.is_multiple_of(4),
             "probe width must be divisible by four for side-by-side NV12"
         );
         ensure!(
-            self.height > 0 && self.height % 2 == 0,
+            self.height > 0 && self.height.is_multiple_of(2),
             "probe height must be even"
         );
         ensure!(self.fps > 0, "probe FPS must be greater than zero");
@@ -84,6 +84,7 @@ impl ProbeConfig {
 pub struct CadenceReport {
     pub submitted: u64,
     pub encoded: u64,
+    pub transported: u64,
     pub wall_elapsed: Duration,
     pub source_write_average: Duration,
     pub source_write_max: Duration,
@@ -98,9 +99,10 @@ impl fmt::Display for CadenceReport {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             formatter,
-            "surface_probe cadence submitted={} encoded={} wall_ms={} source_write_avg_us={} source_write_max_us={} encode_submit_avg_us={} encode_submit_max_us={} deadline_misses={} deadline_miss_max_us={} min_available_leases={}",
+            "surface_probe cadence submitted={} encoded={} alvr_sent={} wall_ms={} source_write_avg_us={} source_write_max_us={} encode_submit_avg_us={} encode_submit_max_us={} deadline_misses={} deadline_miss_max_us={} min_available_leases={}",
             self.submitted,
             self.encoded,
+            self.transported,
             self.wall_elapsed.as_millis(),
             self.source_write_average.as_micros(),
             self.source_write_max.as_micros(),
@@ -121,6 +123,7 @@ pub struct ProbeSummary {
     pub requested_frames: u64,
     pub submitted_frames: u64,
     pub encoded_frames: u64,
+    pub transported_frames: u64,
     pub wall_elapsed: Duration,
     pub deadline_misses: u64,
     pub deadline_miss_max: Duration,
@@ -135,13 +138,14 @@ impl fmt::Display for ProbeSummary {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             formatter,
-            "surface_probe summary shape={}x{} fps={} requested={} submitted={} encoded={} wall_ms={} achieved_fps={:.3} hardware_hevc={} deadline_misses={} deadline_miss_max_us={} pool_available={}/{} leases_acquired={} leases_recycled={} alvr_connected={} last_video_timestamp_ns={} last_pose_timestamp_ns={}",
+            "surface_probe summary shape={}x{} fps={} requested={} submitted={} encoded={} alvr_sent={} wall_ms={} achieved_fps={:.3} hardware_hevc={} deadline_misses={} deadline_miss_max_us={} pool_available={}/{} leases_acquired={} leases_recycled={} alvr_connected={} last_video_timestamp_ns={} last_pose_timestamp_ns={}",
             self.width,
             self.height,
             self.fps,
             self.requested_frames,
             self.submitted_frames,
             self.encoded_frames,
+            self.transported_frames,
             self.wall_elapsed.as_millis(),
             self.submitted_frames as f64 / self.wall_elapsed.as_secs_f64(),
             self.hardware_support.hardware_accelerated,
@@ -180,6 +184,7 @@ pub fn run_surface_probe(
     let mut cadence = CadenceAccumulator::new(config.telemetry_interval, config.buffer_count);
     let mut submitted = 0;
     let mut encoded = 0;
+    let mut transported = 0;
     let mut total_deadline_misses = 0;
     let mut total_deadline_miss_max = Duration::ZERO;
     let mut last_video_timestamp = Duration::ZERO;
@@ -198,13 +203,17 @@ pub fn run_surface_probe(
             thread::sleep(sleep_duration);
         }
 
-        encoded += dispatch_outputs(encoder.drain_ready()?, &mut sink)?;
+        let dispatch = dispatch_outputs(encoder.drain_ready()?, &mut sink)?;
+        encoded += dispatch.encoded;
+        transported += dispatch.transported;
         let acquire_deadline = Instant::now() + Duration::from_secs(1);
         let mut lease = loop {
             if let Some(lease) = pool.try_acquire()? {
                 break lease;
             }
-            encoded += dispatch_outputs(encoder.drain_ready()?, &mut sink)?;
+            let dispatch = dispatch_outputs(encoder.drain_ready()?, &mut sink)?;
+            encoded += dispatch.encoded;
+            transported += dispatch.transported;
             ensure!(
                 Instant::now() < acquire_deadline,
                 "surface pool remained exhausted for one second with {} encoder frames pending",
@@ -230,16 +239,18 @@ pub fn run_surface_probe(
         );
         last_video_timestamp = metadata.video_timestamp;
         last_pose_timestamp = metadata.pose_timestamp;
-        let force_keyframe = frame_id % u64::from(config.fps) == 0
-            || sink
-                .as_mut()
-                .is_some_and(AlvrVideoSink::take_force_keyframe);
+        let requested_keyframe = sink
+            .as_mut()
+            .is_some_and(AlvrVideoSink::take_force_keyframe);
+        let force_keyframe = frame_id % u64::from(config.fps) == 0 || requested_keyframe;
 
         let encode_start = Instant::now();
         let outputs = encoder.submit(lease, metadata, force_keyframe)?;
         let encode_elapsed = encode_start.elapsed();
         submitted += 1;
-        encoded += dispatch_outputs(outputs, &mut sink)?;
+        let dispatch = dispatch_outputs(outputs, &mut sink)?;
+        encoded += dispatch.encoded;
+        transported += dispatch.transported;
 
         let next_deadline = start + frame_interval.mul_f64(submitted as f64);
         let deadline_miss = Instant::now().checked_duration_since(next_deadline);
@@ -248,8 +259,11 @@ pub fn run_surface_probe(
             total_deadline_miss_max = total_deadline_miss_max.max(miss);
         }
         if let Some(cadence_report) = cadence.record(
-            submitted,
-            encoded,
+            FrameProgress {
+                submitted,
+                encoded,
+                transported,
+            },
             start.elapsed(),
             source_elapsed,
             encode_elapsed,
@@ -259,8 +273,17 @@ pub fn run_surface_probe(
         }
     }
 
-    encoded += dispatch_outputs(encoder.finish()?, &mut sink)?;
-    if let Some(cadence_report) = cadence.finish(submitted, encoded, start.elapsed()) {
+    let dispatch = dispatch_outputs(encoder.finish()?, &mut sink)?;
+    encoded += dispatch.encoded;
+    transported += dispatch.transported;
+    if let Some(cadence_report) = cadence.finish(
+        FrameProgress {
+            submitted,
+            encoded,
+            transported,
+        },
+        start.elapsed(),
+    ) {
         report(cadence_report);
     }
 
@@ -283,8 +306,16 @@ pub fn run_surface_probe(
     );
     let connected_to_alvr = sink.as_mut().is_some_and(|sink| {
         sink.poll_events();
-        sink.connected()
+        sink.ever_connected()
     });
+    ensure!(
+        !config.connect_to_alvr || connected_to_alvr,
+        "ALVR transport probe never reached ClientConnected; a fresh or changed session may have primed restart settings, so rerun the same bounded command"
+    );
+    ensure!(
+        !config.connect_to_alvr || transported > 0,
+        "ALVR transport connected but no encoded frames were sent"
+    );
 
     Ok(ProbeSummary {
         width: config.width,
@@ -293,6 +324,7 @@ pub fn run_surface_probe(
         requested_frames: config.frame_count,
         submitted_frames: submitted,
         encoded_frames: encoded,
+        transported_frames: transported,
         wall_elapsed: start.elapsed(),
         deadline_misses: total_deadline_misses,
         deadline_miss_max: total_deadline_miss_max,
@@ -304,14 +336,26 @@ pub fn run_surface_probe(
     })
 }
 
-fn dispatch_outputs(outputs: Vec<EncodedFrame>, sink: &mut Option<AlvrVideoSink>) -> Result<u64> {
-    let count = outputs.len() as u64;
+#[derive(Default)]
+struct DispatchCounts {
+    encoded: u64,
+    transported: u64,
+}
+
+fn dispatch_outputs(
+    outputs: Vec<EncodedFrame>,
+    sink: &mut Option<AlvrVideoSink>,
+) -> Result<DispatchCounts> {
+    let mut counts = DispatchCounts {
+        encoded: outputs.len() as u64,
+        transported: 0,
+    };
     if let Some(sink) = sink {
         for output in outputs {
-            sink.send(output)?;
+            counts.transported += u64::from(sink.send(output)?);
         }
     }
-    Ok(count)
+    Ok(counts)
 }
 
 struct CadenceAccumulator {
@@ -325,6 +369,13 @@ struct CadenceAccumulator {
     deadline_miss_max: Duration,
     minimum_available: usize,
     capacity: usize,
+}
+
+#[derive(Clone, Copy)]
+struct FrameProgress {
+    submitted: u64,
+    encoded: u64,
+    transported: u64,
 }
 
 impl CadenceAccumulator {
@@ -349,8 +400,7 @@ impl CadenceAccumulator {
 
     fn record(
         &mut self,
-        submitted: u64,
-        encoded: u64,
+        progress: FrameProgress,
         wall_elapsed: Duration,
         source_elapsed: Duration,
         encode_elapsed: Duration,
@@ -366,29 +416,19 @@ impl CadenceAccumulator {
             self.deadline_miss_max = self.deadline_miss_max.max(miss);
         }
 
-        (self.window_frames == self.interval)
-            .then(|| self.take_report(submitted, encoded, wall_elapsed))
+        (self.window_frames == self.interval).then(|| self.take_report(progress, wall_elapsed))
     }
 
-    fn finish(
-        &mut self,
-        submitted: u64,
-        encoded: u64,
-        wall_elapsed: Duration,
-    ) -> Option<CadenceReport> {
-        (self.window_frames > 0).then(|| self.take_report(submitted, encoded, wall_elapsed))
+    fn finish(&mut self, progress: FrameProgress, wall_elapsed: Duration) -> Option<CadenceReport> {
+        (self.window_frames > 0).then(|| self.take_report(progress, wall_elapsed))
     }
 
-    fn take_report(
-        &mut self,
-        submitted: u64,
-        encoded: u64,
-        wall_elapsed: Duration,
-    ) -> CadenceReport {
+    fn take_report(&mut self, progress: FrameProgress, wall_elapsed: Duration) -> CadenceReport {
         let window_frames = self.window_frames;
         let report = CadenceReport {
-            submitted,
-            encoded,
+            submitted: progress.submitted,
+            encoded: progress.encoded,
+            transported: progress.transported,
             wall_elapsed,
             source_write_average: self.source_total / window_frames as u32,
             source_write_max: self.source_max,
