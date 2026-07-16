@@ -14,6 +14,13 @@ pub use c_api::*;
 pub use logging_backend::init_logging;
 pub use tracking::HandType;
 
+pub fn compute_restart_settings_hash(
+    steamvr_hmd_init_config: &SteamvrHmdInitConfig,
+    settings: &Settings,
+) -> u64 {
+    connection::compute_restart_settings_hash(steamvr_hmd_init_config, settings)
+}
+
 use crate::connection::VideoPacket;
 use alvr_common::{
     ConnectionState, DEVICE_ID_TO_PATH, DeviceMotion, LifecycleState, Pose, ViewParams,
@@ -27,11 +34,11 @@ use alvr_events::{EventType, HapticsEvent};
 use alvr_filesystem as afs;
 use alvr_packets::{
     BatteryInfo, ButtonEntry, ClientConnectionsAction, DecoderInitializationConfig, Haptics,
-    VideoPacketHeader,
+    ServerControlPacket, VideoPacketHeader,
 };
 use alvr_server_io::ServerSessionManager;
 use alvr_session::{CodecType, H264Profile, OpenvrProperty, Settings, SteamvrHmdInitConfig};
-use alvr_sockets::StreamSender;
+use alvr_sockets::{ControlSocketSender, StreamSender};
 use bitrate::{BitrateManager, DynamicEncoderParams};
 use statistics::StatisticsManager;
 use std::{
@@ -95,6 +102,7 @@ pub enum ServerCoreEvent {
     Tracking {
         poll_timestamp: Duration,
     },
+    RawButtons(Vec<ButtonEntry>),
     Buttons(Vec<ButtonEntry>), // Note: this is after mapping
     RequestIDR,
     CaptureFrame,
@@ -114,6 +122,7 @@ pub struct ConnectionContext {
     video_recording_file: Mutex<Option<File>>,
     connection_threads: Mutex<Vec<JoinHandle<()>>>,
     clients_to_be_removed: Mutex<HashSet<String>>,
+    control_sender: Mutex<Option<Arc<Mutex<ControlSocketSender<ServerControlPacket>>>>>,
     video_channel_sender: Mutex<Option<SyncSender<VideoPacket>>>,
     haptics_sender: Mutex<Option<StreamSender<Haptics>>>,
 }
@@ -232,6 +241,7 @@ impl ServerCoreContext {
             video_recording_file: Mutex::new(None),
             connection_threads: Mutex::new(Vec::new()),
             clients_to_be_removed: Mutex::new(HashSet::new()),
+            control_sender: Mutex::new(None),
             video_channel_sender: Mutex::new(None),
             haptics_sender: Mutex::new(None),
         });
@@ -374,11 +384,21 @@ impl ServerCoreContext {
             file.write_all(&config_buffer).ok();
         }
 
-        *self.connection_context.decoder_config.lock() = Some(DecoderInitializationConfig {
+        let config = DecoderInitializationConfig {
             codec,
             config_buffer,
             ext_str: String::new(),
-        });
+        };
+        *self.connection_context.decoder_config.lock() = Some(config.clone());
+
+        let control_sender = self.connection_context.control_sender.lock().clone();
+        if let Some(sender) = control_sender
+            && let Err(error) = sender
+                .lock()
+                .send(&ServerControlPacket::DecoderConfig(config))
+        {
+            warn!("Failed to send decoder configuration: {error}");
+        }
     }
 
     pub fn send_video_nal(
@@ -387,7 +407,7 @@ impl ServerCoreContext {
         global_view_params: [ViewParams; 2],
         is_idr: bool,
         nal_buffer: Vec<u8>,
-    ) {
+    ) -> bool {
         dbg_server_core!("send_video_nal");
 
         // start in the corrupts state, the client didn't receive the initial IDR yet.
@@ -395,7 +415,12 @@ impl ServerCoreContext {
         static LAST_IDR_INSTANT: LazyLock<Mutex<Instant>> =
             LazyLock::new(|| Mutex::new(Instant::now()));
 
-        if let Some(sender) = &*self.connection_context.video_channel_sender.lock() {
+        let sender_guard = self.connection_context.video_channel_sender.lock();
+        let Some(sender) = sender_guard.as_ref() else {
+            return false;
+        };
+        let mut enqueued = false;
+        {
             let buffer_size = nal_buffer.len();
 
             if is_idr {
@@ -448,13 +473,19 @@ impl ServerCoreContext {
                     },
                     payload: nal_buffer,
                 });
-                if matches!(sender_result, Err(TrySendError::Full(_))) {
-                    STREAM_CORRUPTED.store(true, Ordering::SeqCst);
-                    self.connection_context
-                        .events_sender
-                        .send(ServerCoreEvent::RequestIDR)
-                        .ok();
-                    warn!("Dropping video packet. Reason: Can't push to network");
+                match sender_result {
+                    Ok(()) => enqueued = true,
+                    Err(TrySendError::Full(_)) => {
+                        STREAM_CORRUPTED.store(true, Ordering::SeqCst);
+                        self.connection_context
+                            .events_sender
+                            .send(ServerCoreEvent::RequestIDR)
+                            .ok();
+                        warn!("Dropping video packet. Reason: Can't push to network");
+                    }
+                    Err(TrySendError::Disconnected(_)) => {
+                        warn!("Dropping video packet. Reason: Video channel disconnected");
+                    }
                 }
             } else {
                 warn!("Dropping video packet. Reason: Waiting for IDR frame");
@@ -469,6 +500,7 @@ impl ServerCoreContext {
                     .report_frame_encoded(timestamp, encoder_latency, buffer_size);
             }
         }
+        enqueued
     }
 
     pub fn get_dynamic_encoder_params(&self) -> Option<DynamicEncoderParams> {

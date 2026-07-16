@@ -35,6 +35,15 @@ unsafe extern "C" {
 unsafe extern "C" {
     static kCVPixelBufferIOSurfacePropertiesKey: *const c_void;
     static kCVPixelBufferMetalCompatibilityKey: *const c_void;
+    static kCVImageBufferYCbCrMatrixKey: *const c_void;
+    static kCVImageBufferYCbCrMatrix_ITU_R_709_2: *const c_void;
+    static kCVImageBufferColorPrimariesKey: *const c_void;
+    static kCVImageBufferColorPrimaries_ITU_R_709_2: *const c_void;
+    static kCVImageBufferTransferFunctionKey: *const c_void;
+    static kCVImageBufferTransferFunction_ITU_R_709_2: *const c_void;
+    static kCVImageBufferChromaLocationTopFieldKey: *const c_void;
+    static kCVImageBufferChromaLocationBottomFieldKey: *const c_void;
+    static kCVImageBufferChromaLocation_Center: *const c_void;
 
     fn CVPixelBufferCreate(
         allocator: *const c_void,
@@ -64,6 +73,12 @@ unsafe extern "C" {
     ) -> usize;
     fn CVPixelBufferGetWidthOfPlane(pixel_buffer: CVPixelBufferRef, plane_index: usize) -> usize;
     fn CVPixelBufferGetHeightOfPlane(pixel_buffer: CVPixelBufferRef, plane_index: usize) -> usize;
+    fn CVBufferSetAttachment(
+        buffer: CVPixelBufferRef,
+        key: *const c_void,
+        value: *const c_void,
+        attachment_mode: u32,
+    );
 }
 
 #[link(name = "IOSurface", kind = "framework")]
@@ -134,7 +149,6 @@ struct PixelPlane {
 
 struct NativeSurface {
     pixel_buffer: CVPixelBufferRef,
-    iosurface: IOSurfaceRef,
     surface_id: u32,
     width: u32,
     height: u32,
@@ -188,12 +202,12 @@ impl NativeSurface {
 
         let surface = Self {
             pixel_buffer,
-            iosurface,
             surface_id: unsafe { IOSurfaceGetID(iosurface) },
             width,
             height,
         };
         surface.validate_layout()?;
+        surface.set_color_attachments();
         surface.initialize_neutral()?;
 
         Ok(surface)
@@ -250,6 +264,42 @@ impl NativeSurface {
         }
 
         Ok(())
+    }
+
+    fn set_color_attachments(&self) {
+        const SHOULD_PROPAGATE: u32 = 1;
+        unsafe {
+            CVBufferSetAttachment(
+                self.pixel_buffer,
+                kCVImageBufferYCbCrMatrixKey,
+                kCVImageBufferYCbCrMatrix_ITU_R_709_2,
+                SHOULD_PROPAGATE,
+            );
+            CVBufferSetAttachment(
+                self.pixel_buffer,
+                kCVImageBufferColorPrimariesKey,
+                kCVImageBufferColorPrimaries_ITU_R_709_2,
+                SHOULD_PROPAGATE,
+            );
+            CVBufferSetAttachment(
+                self.pixel_buffer,
+                kCVImageBufferTransferFunctionKey,
+                kCVImageBufferTransferFunction_ITU_R_709_2,
+                SHOULD_PROPAGATE,
+            );
+            CVBufferSetAttachment(
+                self.pixel_buffer,
+                kCVImageBufferChromaLocationTopFieldKey,
+                kCVImageBufferChromaLocation_Center,
+                SHOULD_PROPAGATE,
+            );
+            CVBufferSetAttachment(
+                self.pixel_buffer,
+                kCVImageBufferChromaLocationBottomFieldKey,
+                kCVImageBufferChromaLocation_Center,
+                SHOULD_PROPAGATE,
+            );
+        }
     }
 
     fn write_probe_marker(&mut self, frame_id: u64) -> Result<()> {
@@ -381,12 +431,8 @@ impl SurfaceLease {
         self.surface().height
     }
 
-    pub fn cv_pixel_buffer(&self) -> NonNull<c_void> {
+    pub(crate) fn cv_pixel_buffer(&self) -> NonNull<c_void> {
         NonNull::new(self.surface().pixel_buffer).expect("CVPixelBuffer pointer must be non-null")
-    }
-
-    pub fn iosurface(&self) -> NonNull<c_void> {
-        NonNull::new(self.surface().iosurface).expect("IOSurface pointer must be non-null")
     }
 
     pub fn write_probe_marker(&mut self, frame_id: u64) -> Result<()> {

@@ -58,6 +58,16 @@ impl ProbeConfig {
             self.height > 0 && self.height.is_multiple_of(2),
             "probe height must be even"
         );
+        if self.connect_to_alvr {
+            ensure!(
+                self.width.is_multiple_of(64),
+                "ALVR-connected probe width must be divisible by 64"
+            );
+            ensure!(
+                self.height.is_multiple_of(32),
+                "ALVR-connected probe height must be divisible by 32"
+            );
+        }
         ensure!(self.fps > 0, "probe FPS must be greater than zero");
         ensure!(
             self.bitrate_bps > 0,
@@ -176,7 +186,7 @@ pub fn run_surface_probe(
     })?;
     let mut sink = config
         .connect_to_alvr
-        .then(|| AlvrVideoSink::start(&config.alvr_root))
+        .then(|| AlvrVideoSink::start(&config.alvr_root, config.width, config.height, config.fps))
         .transpose()?;
     let fallback_view_params = default_stereo_view_params(config.width, config.height);
     let frame_interval = Duration::from_secs_f64(1.0 / f64::from(config.fps));
@@ -191,11 +201,14 @@ pub fn run_surface_probe(
     let mut last_pose_timestamp = Duration::ZERO;
 
     for frame_id in 0..config.frame_count {
-        if sink.as_mut().is_some_and(|sink| {
+        if let Some(sink) = sink.as_mut() {
             sink.poll_events();
-            sink.shutdown_requested()
-        }) {
-            break;
+            if let Some(error) = sink.connection_error() {
+                anyhow::bail!("ALVR stream contract failed: {error}");
+            }
+            if sink.shutdown_requested() {
+                break;
+            }
         }
 
         let target = start + frame_interval.mul_f64(frame_id as f64);
@@ -228,15 +241,20 @@ pub fn run_surface_probe(
         let source_elapsed = source_start.elapsed();
 
         let video_timestamp = start.elapsed();
-        let metadata = sink.as_mut().map_or(
+        let metadata = if let Some(sink) = sink.as_mut() {
+            let Some(metadata) = sink.frame_metadata(frame_id, video_timestamp, None)? else {
+                continue;
+            };
+            metadata
+        } else {
             FrameMetadata {
                 frame_id,
+                stream_epoch: 0,
                 video_timestamp,
                 pose_timestamp: video_timestamp,
                 global_view_params: fallback_view_params,
-            },
-            |sink| sink.frame_metadata(frame_id, video_timestamp, fallback_view_params),
-        );
+            }
+        };
         last_video_timestamp = metadata.video_timestamp;
         last_pose_timestamp = metadata.pose_timestamp;
         let requested_keyframe = sink
@@ -337,22 +355,37 @@ pub fn run_surface_probe(
 }
 
 #[derive(Default)]
-struct DispatchCounts {
-    encoded: u64,
-    transported: u64,
+pub(crate) struct DispatchCounts {
+    pub encoded: u64,
+    pub transported: u64,
+    pub encoded_bytes: u64,
+    pub transported_bytes: u64,
+    pub keyframes: u64,
+    pub keyframe_bytes: u64,
+    pub max_frame_bytes: u64,
 }
 
-fn dispatch_outputs(
+pub(crate) fn dispatch_outputs(
     outputs: Vec<EncodedFrame>,
     sink: &mut Option<AlvrVideoSink>,
 ) -> Result<DispatchCounts> {
-    let mut counts = DispatchCounts {
-        encoded: outputs.len() as u64,
-        transported: 0,
-    };
-    if let Some(sink) = sink {
-        for output in outputs {
-            counts.transported += u64::from(sink.send(output)?);
+    let mut counts = DispatchCounts::default();
+    for output in outputs {
+        let frame_bytes =
+            output.nal_data.len() + output.decoder_config_nals.as_ref().map_or(0, Vec::len);
+        let frame_bytes = u64::try_from(frame_bytes).unwrap_or(u64::MAX);
+        counts.encoded += 1;
+        counts.encoded_bytes = counts.encoded_bytes.saturating_add(frame_bytes);
+        counts.max_frame_bytes = counts.max_frame_bytes.max(frame_bytes);
+        if output.is_keyframe {
+            counts.keyframes += 1;
+            counts.keyframe_bytes = counts.keyframe_bytes.saturating_add(frame_bytes);
+        }
+        if let Some(sink) = sink.as_mut()
+            && sink.send(output)?
+        {
+            counts.transported += 1;
+            counts.transported_bytes = counts.transported_bytes.saturating_add(frame_bytes);
         }
     }
     Ok(counts)
@@ -450,7 +483,7 @@ impl CadenceAccumulator {
     }
 }
 
-fn default_stereo_view_params(width: u32, height: u32) -> [ViewParams; 2] {
+pub(crate) fn default_stereo_view_params(width: u32, height: u32) -> [ViewParams; 2] {
     let eye_width = width / 2;
     let horizontal_half_fov = std::f32::consts::FRAC_PI_4;
     let vertical_half_fov = (horizontal_half_fov.tan() * height as f32 / eye_width as f32).atan();

@@ -461,6 +461,7 @@ fn spawn_event_loop(events_receiver: mpsc::Receiver<ServerCoreEvent>) {
                         };
                     }
                 }
+                ServerCoreEvent::RawButtons(_) => {}
                 ServerCoreEvent::Buttons(entries) => {
                     for entry in entries {
                         let value = match entry.value {

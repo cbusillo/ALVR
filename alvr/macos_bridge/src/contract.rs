@@ -1,11 +1,10 @@
 use alvr_common::ViewParams;
-#[cfg(any(target_os = "macos", test))]
-use std::collections::VecDeque;
 use std::{error::Error, fmt, time::Duration};
 
 #[derive(Clone, Copy)]
 pub struct FrameMetadata {
     pub frame_id: u64,
+    pub stream_epoch: u64,
     pub video_timestamp: Duration,
     pub pose_timestamp: Duration,
     pub global_view_params: [ViewParams; 2],
@@ -16,6 +15,7 @@ impl fmt::Debug for FrameMetadata {
         formatter
             .debug_struct("FrameMetadata")
             .field("frame_id", &self.frame_id)
+            .field("stream_epoch", &self.stream_epoch)
             .field("video_timestamp", &self.video_timestamp)
             .field("pose_timestamp", &self.pose_timestamp)
             .finish_non_exhaustive()
@@ -31,6 +31,7 @@ pub struct SurfaceLeaseId {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ContractError {
     FrameIdOutOfOrder { previous: u64, next: u64 },
+    StreamEpochOutOfOrder { previous: u64, next: u64 },
     VideoTimestampOutOfOrder { previous: Duration, next: Duration },
     PoseTimestampOutOfOrder { previous: Duration, next: Duration },
 }
@@ -41,6 +42,10 @@ impl fmt::Display for ContractError {
             Self::FrameIdOutOfOrder { previous, next } => write!(
                 formatter,
                 "frame IDs must increase strictly: previous={previous} next={next}"
+            ),
+            Self::StreamEpochOutOfOrder { previous, next } => write!(
+                formatter,
+                "stream epochs must not decrease: previous={previous} next={next}"
             ),
             Self::VideoTimestampOutOfOrder { previous, next } => write!(
                 formatter,
@@ -60,35 +65,19 @@ impl Error for ContractError {}
 #[cfg(any(target_os = "macos", test))]
 struct FrameOrderKey {
     frame_id: u64,
+    stream_epoch: u64,
     video_timestamp: Duration,
     pose_timestamp: Duration,
 }
 
 #[cfg(any(target_os = "macos", test))]
-pub(crate) struct PendingSubmission<T> {
-    pub lease_id: SurfaceLeaseId,
-    pub metadata: FrameMetadata,
-    pub resource: T,
-}
-
-#[cfg(any(target_os = "macos", test))]
-pub(crate) struct OrderedPending<T> {
+#[derive(Default)]
+pub(crate) struct FrameOrderValidator {
     last_submission: Option<FrameOrderKey>,
-    queue: VecDeque<PendingSubmission<T>>,
 }
 
 #[cfg(any(target_os = "macos", test))]
-impl<T> Default for OrderedPending<T> {
-    fn default() -> Self {
-        Self {
-            last_submission: None,
-            queue: VecDeque::new(),
-        }
-    }
-}
-
-#[cfg(any(target_os = "macos", test))]
-impl<T> OrderedPending<T> {
+impl FrameOrderValidator {
     pub fn validate(&self, metadata: &FrameMetadata) -> Result<(), ContractError> {
         let Some(previous) = self.last_submission else {
             return Ok(());
@@ -100,13 +89,23 @@ impl<T> OrderedPending<T> {
                 next: metadata.frame_id,
             });
         }
-        if metadata.video_timestamp <= previous.video_timestamp {
+        if metadata.stream_epoch < previous.stream_epoch {
+            return Err(ContractError::StreamEpochOutOfOrder {
+                previous: previous.stream_epoch,
+                next: metadata.stream_epoch,
+            });
+        }
+        if metadata.stream_epoch == previous.stream_epoch
+            && metadata.video_timestamp <= previous.video_timestamp
+        {
             return Err(ContractError::VideoTimestampOutOfOrder {
                 previous: previous.video_timestamp,
                 next: metadata.video_timestamp,
             });
         }
-        if metadata.pose_timestamp < previous.pose_timestamp {
+        if metadata.stream_epoch == previous.stream_epoch
+            && metadata.pose_timestamp < previous.pose_timestamp
+        {
             return Err(ContractError::PoseTimestampOutOfOrder {
                 previous: previous.pose_timestamp,
                 next: metadata.pose_timestamp,
@@ -116,30 +115,13 @@ impl<T> OrderedPending<T> {
         Ok(())
     }
 
-    pub fn push_validated(
-        &mut self,
-        lease_id: SurfaceLeaseId,
-        metadata: FrameMetadata,
-        resource: T,
-    ) {
+    pub fn record_validated(&mut self, metadata: FrameMetadata) {
         self.last_submission = Some(FrameOrderKey {
             frame_id: metadata.frame_id,
+            stream_epoch: metadata.stream_epoch,
             video_timestamp: metadata.video_timestamp,
             pose_timestamp: metadata.pose_timestamp,
         });
-        self.queue.push_back(PendingSubmission {
-            lease_id,
-            metadata,
-            resource,
-        });
-    }
-
-    pub fn pop_output(&mut self) -> Option<PendingSubmission<T>> {
-        self.queue.pop_front()
-    }
-
-    pub fn len(&self) -> usize {
-        self.queue.len()
     }
 }
 
@@ -147,101 +129,79 @@ impl<T> OrderedPending<T> {
 mod tests {
     use super::*;
 
-    fn metadata(frame_id: u64, video_ms: u64, pose_ms: u64) -> FrameMetadata {
+    fn metadata_for_epoch(
+        frame_id: u64,
+        stream_epoch: u64,
+        video_ms: u64,
+        pose_ms: u64,
+    ) -> FrameMetadata {
         FrameMetadata {
             frame_id,
+            stream_epoch,
             video_timestamp: Duration::from_millis(video_ms),
             pose_timestamp: Duration::from_millis(pose_ms),
             global_view_params: [ViewParams::DUMMY; 2],
         }
     }
 
-    fn submit<T>(
-        queue: &mut OrderedPending<T>,
-        lease_id: SurfaceLeaseId,
+    fn metadata(frame_id: u64, video_ms: u64, pose_ms: u64) -> FrameMetadata {
+        metadata_for_epoch(frame_id, 0, video_ms, pose_ms)
+    }
+
+    fn submit(
+        validator: &mut FrameOrderValidator,
         metadata: FrameMetadata,
-        resource: T,
     ) -> Result<(), ContractError> {
-        queue.validate(&metadata)?;
-        queue.push_validated(lease_id, metadata, resource);
+        validator.validate(&metadata)?;
+        validator.record_validated(metadata);
         Ok(())
     }
 
     #[test]
-    fn preserves_independent_timestamps_and_fifo_lease_order() {
-        let first_id = SurfaceLeaseId {
-            surface_id: 41,
-            generation: 1,
-        };
-        let second_id = SurfaceLeaseId {
-            surface_id: 17,
-            generation: 2,
-        };
-        let mut queue = OrderedPending::default();
+    fn accepts_independent_monotonic_timestamps() {
+        let mut validator = FrameOrderValidator::default();
 
-        submit(&mut queue, first_id, metadata(10, 100, 80), "first").unwrap();
-        submit(&mut queue, second_id, metadata(11, 111, 90), "second").unwrap();
-
-        let first = queue.pop_output().unwrap();
-        assert_eq!(first.lease_id, first_id);
-        assert_eq!(first.metadata.video_timestamp, Duration::from_millis(100));
-        assert_eq!(first.metadata.pose_timestamp, Duration::from_millis(80));
-        assert_eq!(first.resource, "first");
-
-        let second = queue.pop_output().unwrap();
-        assert_eq!(second.lease_id, second_id);
-        assert_eq!(second.metadata.video_timestamp, Duration::from_millis(111));
-        assert_eq!(second.metadata.pose_timestamp, Duration::from_millis(90));
-        assert_eq!(second.resource, "second");
-        assert!(queue.pop_output().is_none());
+        submit(&mut validator, metadata(10, 100, 80)).unwrap();
+        submit(&mut validator, metadata(11, 111, 90)).unwrap();
     }
 
     #[test]
-    fn rejects_metadata_regressions_without_consuming_a_lease() {
-        let lease_id = SurfaceLeaseId {
-            surface_id: 1,
-            generation: 1,
-        };
-        let mut queue = OrderedPending::default();
-        submit(&mut queue, lease_id, metadata(5, 50, 40), ()).unwrap();
+    fn rejects_metadata_regressions_without_advancing() {
+        let mut validator = FrameOrderValidator::default();
+        submit(&mut validator, metadata(5, 50, 40)).unwrap();
 
         assert!(matches!(
-            queue.validate(&metadata(5, 60, 50)),
+            validator.validate(&metadata(5, 60, 50)),
             Err(ContractError::FrameIdOutOfOrder { .. })
         ));
         assert!(matches!(
-            queue.validate(&metadata(6, 50, 50)),
+            validator.validate(&metadata(6, 50, 50)),
             Err(ContractError::VideoTimestampOutOfOrder { .. })
         ));
         assert!(matches!(
-            queue.validate(&metadata(6, 60, 39)),
+            validator.validate(&metadata(6, 60, 39)),
             Err(ContractError::PoseTimestampOutOfOrder { .. })
         ));
-        assert_eq!(queue.len(), 1);
+
+        submit(&mut validator, metadata(6, 60, 40)).unwrap();
     }
 
     #[test]
     fn allows_reusing_one_pose_sample_for_multiple_video_frames() {
-        let mut queue = OrderedPending::default();
-        submit(
-            &mut queue,
-            SurfaceLeaseId {
-                surface_id: 1,
-                generation: 1,
-            },
-            metadata(1, 10, 8),
-            (),
-        )
-        .unwrap();
-        submit(
-            &mut queue,
-            SurfaceLeaseId {
-                surface_id: 2,
-                generation: 2,
-            },
-            metadata(2, 20, 8),
-            (),
-        )
-        .unwrap();
+        let mut validator = FrameOrderValidator::default();
+        submit(&mut validator, metadata(1, 10, 8)).unwrap();
+        submit(&mut validator, metadata(2, 20, 8)).unwrap();
+    }
+
+    #[test]
+    fn allows_timestamp_reset_for_a_new_stream_epoch() {
+        let mut validator = FrameOrderValidator::default();
+        submit(&mut validator, metadata_for_epoch(1, 4, 100, 90)).unwrap();
+        submit(&mut validator, metadata_for_epoch(2, 5, 10, 8)).unwrap();
+
+        assert!(matches!(
+            validator.validate(&metadata_for_epoch(3, 4, 110, 100)),
+            Err(ContractError::StreamEpochOutOfOrder { .. })
+        ));
     }
 }

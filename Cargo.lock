@@ -384,9 +384,12 @@ version = "21.0.0-dev12"
 dependencies = [
  "alvr_common",
  "alvr_filesystem",
+ "alvr_packets",
  "alvr_server_core",
  "alvr_session",
  "anyhow",
+ "cc",
+ "memmap2",
  "serde_json",
  "shiguredo_video_toolbox",
 ]
@@ -5601,9 +5604,9 @@ dependencies = [
 
 [[package]]
 name = "shiguredo_video_toolbox"
-version = "2026.1.1"
+version = "2026.2.0-canary.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "200357d99d8d88d9bcee25fb8a8be6cb0663548e0614481f2e4e5b4148afdd0b"
+checksum = "67d32fa884a79760383b714d49b19bb9c2bd8d9850a3521010364bacbab4a11b"
 dependencies = [
  "bindgen",
  "log",

@@ -1,13 +1,15 @@
-use crate::{
-    FrameMetadata, SurfaceLease, SurfaceLeaseId,
-    contract::{OrderedPending, PendingSubmission},
-};
-use anyhow::{Context, Result, ensure};
+use crate::{FrameMetadata, SurfaceLease, SurfaceLeaseId, contract::FrameOrderValidator};
+use anyhow::{Context, Result, anyhow, ensure};
 use shiguredo_video_toolbox::{
     CodecConfig, EncodeOptions, EncodedFrame as VideoToolboxFrame, Encoder, EncoderConfig,
-    HevcEncoderConfig, HevcProfile, PixelFormat, VideoCodecType, supported_codecs,
+    Error as VideoToolboxError, FnEncodeHandler, HevcEncoderConfig, HevcProfile, PixelFormat,
+    VideoCodecType, supported_codecs,
 };
-use std::{num::NonZeroU32, time::Duration};
+use std::{
+    num::NonZeroU32,
+    sync::mpsc::{self, Receiver, RecvTimeoutError, TryRecvError},
+    time::Duration,
+};
 
 const NAL_START_CODE: [u8; 4] = [0, 0, 0, 1];
 
@@ -55,11 +57,22 @@ pub struct EncodedFrame {
     pub decoder_config_nals: Option<Vec<u8>>,
 }
 
+struct PendingFrame {
+    lease_id: SurfaceLeaseId,
+    metadata: FrameMetadata,
+    lease: SurfaceLease,
+}
+
+type VideoToolboxResult = std::result::Result<VideoToolboxFrame<PendingFrame>, VideoToolboxError>;
+type VideoToolboxEncoder = Encoder<FnEncodeHandler<PendingFrame>>;
+
 pub struct NativeHevcEncoder {
-    encoder: Encoder,
+    encoder: VideoToolboxEncoder,
+    output_rx: Receiver<VideoToolboxResult>,
     width: u32,
     height: u32,
-    pending: OrderedPending<SurfaceLease>,
+    order: FrameOrderValidator,
+    pending_count: usize,
 }
 
 impl NativeHevcEncoder {
@@ -84,34 +97,43 @@ impl NativeHevcEncoder {
             .checked_mul(2)
             .and_then(NonZeroU32::new)
             .context("HEVC keyframe interval overflow")?;
-        let encoder = Encoder::new(EncoderConfig {
-            width: config.width,
-            height: config.height,
-            codec: CodecConfig::Hevc(HevcEncoderConfig {
-                profile: HevcProfile::Main,
-                allow_open_gop: false,
-            }),
-            pixel_format: PixelFormat::Nv12,
-            average_bitrate: Some(config.bitrate_bps),
-            fps_numerator: config.fps,
-            fps_denominator: 1,
-            prioritize_encoding_speed_over_quality: true,
-            real_time: true,
-            maximize_power_efficiency: false,
-            allow_frame_reordering: false,
-            allow_temporal_compression: true,
-            max_key_frame_interval: Some(keyframe_interval),
-            max_key_frame_interval_duration: Some(Duration::from_secs(2)),
-            max_frame_delay_count: NonZeroU32::new(1),
-        })
+        let (output_tx, output_rx) = mpsc::channel();
+        let handler = FnEncodeHandler::new(move |result: VideoToolboxResult| {
+            let _ = output_tx.send(result);
+        });
+        let encoder = Encoder::new(
+            EncoderConfig {
+                width: config.width,
+                height: config.height,
+                codec: CodecConfig::Hevc(HevcEncoderConfig {
+                    profile: HevcProfile::Main,
+                    allow_open_gop: false,
+                }),
+                pixel_format: PixelFormat::Nv12,
+                average_bitrate: Some(config.bitrate_bps),
+                fps_numerator: config.fps,
+                fps_denominator: 1,
+                prioritize_encoding_speed_over_quality: true,
+                real_time: true,
+                maximize_power_efficiency: false,
+                allow_frame_reordering: false,
+                allow_temporal_compression: true,
+                max_key_frame_interval: Some(keyframe_interval),
+                max_key_frame_interval_duration: Some(Duration::from_secs(2)),
+                max_frame_delay_count: NonZeroU32::new(1),
+            },
+            handler,
+        )
         .context("failed to create VideoToolbox HEVC encoder")?;
 
         Ok((
             Self {
                 encoder,
+                output_rx,
                 width: config.width,
                 height: config.height,
-                pending: OrderedPending::default(),
+                order: FrameOrderValidator::default(),
+                pending_count: 0,
             },
             support,
         ))
@@ -131,36 +153,64 @@ impl NativeHevcEncoder {
             self.width,
             self.height
         );
-        self.pending.validate(&metadata)?;
+        self.order.validate(&metadata)?;
+        let pixel_buffer = lease.cv_pixel_buffer().as_ptr();
+        let pending = PendingFrame {
+            lease_id: lease.id(),
+            metadata,
+            lease,
+        };
 
         unsafe {
             self.encoder.encode_pixel_buffer(
-                lease.cv_pixel_buffer().as_ptr(),
+                pixel_buffer,
                 &EncodeOptions {
                     force_key_frame: force_keyframe,
                 },
+                pending,
             )
         }
         .context("failed to submit IOSurface-backed CVPixelBuffer to VideoToolbox")?;
 
-        self.pending.push_validated(lease.id(), metadata, lease);
+        self.order.record_validated(metadata);
+        self.pending_count += 1;
         self.drain_ready()
     }
 
     pub fn drain_ready(&mut self) -> Result<Vec<EncodedFrame>> {
         let mut outputs = Vec::new();
-        while let Some(frame) = self
-            .encoder
-            .next_frame()
-            .context("failed to read VideoToolbox output")?
-        {
-            let pending = self
-                .pending
-                .pop_output()
-                .context("VideoToolbox emitted a frame without pending metadata")?;
-            outputs.push(complete_frame(pending, frame)?);
+        let mut first_error = None;
+        loop {
+            let result = match self.output_rx.try_recv() {
+                Ok(result) => result,
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    return Err(anyhow!("VideoToolbox callback channel disconnected"));
+                }
+            };
+            self.pending_count = self
+                .pending_count
+                .checked_sub(1)
+                .context("VideoToolbox emitted a callback without a pending frame")?;
+            match result {
+                Ok(frame) => match complete_frame(frame) {
+                    Ok(frame) => outputs.push(frame),
+                    Err(error) if first_error.is_none() => first_error = Some(error),
+                    Err(_) => {}
+                },
+                Err(error) if first_error.is_none() => {
+                    first_error = Some(
+                        anyhow!(error).context("VideoToolbox failed to encode a submitted frame"),
+                    );
+                }
+                Err(_) => {}
+            }
         }
-        Ok(outputs)
+        if let Some(error) = first_error {
+            Err(error)
+        } else {
+            Ok(outputs)
+        }
     }
 
     pub fn finish(&mut self) -> Result<Vec<EncodedFrame>> {
@@ -169,27 +219,42 @@ impl NativeHevcEncoder {
             .context("failed to flush VideoToolbox")?;
         let outputs = self.drain_ready()?;
         ensure!(
-            self.pending.len() == 0,
+            self.pending_count == 0,
             "VideoToolbox flush left {} frame leases pending",
-            self.pending.len()
+            self.pending_count
         );
         Ok(outputs)
     }
 
     pub fn pending_count(&self) -> usize {
-        self.pending.len()
+        self.pending_count
     }
 }
 
-fn complete_frame(
-    pending: PendingSubmission<SurfaceLease>,
-    frame: VideoToolboxFrame,
-) -> Result<EncodedFrame> {
-    let PendingSubmission {
+impl Drop for NativeHevcEncoder {
+    fn drop(&mut self) {
+        if self.pending_count == 0 {
+            return;
+        }
+        let _ = self.encoder.finish();
+        while self.pending_count != 0 {
+            match self.output_rx.recv_timeout(Duration::from_secs(1)) {
+                Ok(result) => {
+                    self.pending_count -= 1;
+                    drop(result);
+                }
+                Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => break,
+            }
+        }
+    }
+}
+
+fn complete_frame(frame: VideoToolboxFrame<PendingFrame>) -> Result<EncodedFrame> {
+    let PendingFrame {
         lease_id,
         metadata,
-        resource: lease,
-    } = pending;
+        lease,
+    } = frame.user_data;
     let nal_data = avcc_to_annexb(&frame.data)?;
     let decoder_config_nals = if frame.keyframe {
         let mut config = Vec::new();

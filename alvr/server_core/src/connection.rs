@@ -19,7 +19,7 @@ use alvr_common::{
 };
 use alvr_events::{AdbEvent, ButtonEvent, EventType};
 use alvr_packets::{
-    AUDIO, ClientConnectionResult, ClientConnectionsAction, ClientControlPacket,
+    AUDIO, ButtonEntry, ClientConnectionResult, ClientConnectionsAction, ClientControlPacket,
     ClientNegotiatedStreamingConfig, ClientStatistics, HAPTICS, NegotiatedStreamingConfigExt,
     RealTimeConfig, STATISTICS, ServerControlPacket, StreamConfigPacket, TRACKING, TrackingData,
     VIDEO, VideoPacketHeader,
@@ -273,6 +273,7 @@ pub fn handshake_loop(ctx: Arc<ConnectionContext>, lifecycle_state: Arc<RwLock<L
     };
 
     let mut wired_connection = None;
+    let mut manual_connection_attempts = 0u64;
 
     while *lifecycle_state.read() != LifecycleState::ShuttingDown {
         dbg_connection!("handshake_loop: Try connect to wired device");
@@ -383,16 +384,23 @@ pub fn handshake_loop(ctx: Arc<ConnectionContext>, lifecycle_state: Arc<RwLock<L
             manual_client_ips
         };
 
-        if !available_manual_client_ips.is_empty()
-            && try_connect(
+        if !available_manual_client_ips.is_empty() {
+            manual_connection_attempts += 1;
+            let result = try_connect(
                 Arc::clone(&ctx),
                 Arc::clone(&lifecycle_state),
                 available_manual_client_ips,
-            )
-            .is_ok()
-        {
-            thread::sleep(RETRY_CONNECT_MIN_INTERVAL);
-            continue;
+            );
+            if result.is_ok() {
+                thread::sleep(RETRY_CONNECT_MIN_INTERVAL);
+                continue;
+            }
+            if manual_connection_attempts == 1 || manual_connection_attempts.is_multiple_of(10) {
+                warn!(
+                    "Manual client connection attempt {manual_connection_attempts} failed: {}",
+                    result.unwrap_err()
+                );
+            }
         }
 
         let discovery_config = SESSION_MANAGER
@@ -847,6 +855,8 @@ fn connection_pipeline(
         TrackingManager::new(initial_settings.connection.statistics_history_size);
 
     let control_sender = Arc::new(Mutex::new(socket.request_reliable_stream()?));
+    *ctx.control_sender.lock() = Some(Arc::clone(&control_sender));
+    *ctx.decoder_config.lock() = None;
     let mut video_sender = socket.request_unreliable_stream(VIDEO);
     let game_audio_sender: alvr_sockets::StreamSender<()> = socket.request_unreliable_stream(AUDIO);
     let haptics_sender = socket.request_unreliable_stream(HAPTICS);
@@ -883,9 +893,15 @@ fn connection_pipeline(
                     .unrecenter_view_params(&mut header.global_view_params);
 
                 // todo: use get_buffer and make encoder write to socket buffers directly to avoid copy
-                video_sender
-                    .send_header_with_payload(&header, &payload)
-                    .ok();
+                if let Err(error) = video_sender.send_header_with_payload(&header, &payload) {
+                    warn!(
+                        "Failed to send video packet: bytes={}, idr={}, timestamp_ns={}, error={error:?}",
+                        payload.len(),
+                        header.is_idr,
+                        header.timestamp.as_nanos(),
+                    );
+                    ctx.events_sender.send(ServerCoreEvent::RequestIDR).ok();
+                }
             }
         }
     });
@@ -1235,6 +1251,17 @@ fn connection_pipeline(
                         }
                     }
                     ClientControlPacket::Buttons(entries) => {
+                        ctx.events_sender
+                            .send(ServerCoreEvent::RawButtons(
+                                entries
+                                    .iter()
+                                    .map(|entry| ButtonEntry {
+                                        path_id: entry.path_id,
+                                        value: entry.value,
+                                    })
+                                    .collect(),
+                            ))
+                            .ok();
                         {
                             let session_manager_lock = SESSION_MANAGER.read();
                             if session_manager_lock
@@ -1391,6 +1418,8 @@ fn connection_pipeline(
     dbg_connection!("connection_pipeline: Begin connection shutdown");
 
     // This requests shutdown from threads
+    *ctx.control_sender.lock() = None;
+    *ctx.decoder_config.lock() = None;
     *ctx.video_channel_sender.lock() = None;
     *ctx.haptics_sender.lock() = None;
 
