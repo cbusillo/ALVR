@@ -72,10 +72,10 @@ pub fn set_theme(ctx: &Context) {
     let corner_radius = CornerRadius::same(CORNER_RADIUS);
 
     visuals.widgets.active.bg_fill = ACCENT;
-    visuals.widgets.active.fg_stroke = Stroke::new(1.0, FG);
+    visuals.widgets.active.fg_stroke = Stroke::new(1.0_f32, FG);
     visuals.widgets.active.corner_radius = corner_radius;
 
-    visuals.widgets.inactive.fg_stroke = Stroke::new(1.0, FG);
+    visuals.widgets.inactive.fg_stroke = Stroke::new(1.0_f32, FG);
     visuals.widgets.inactive.corner_radius = corner_radius;
 
     visuals.widgets.hovered.corner_radius = corner_radius;
@@ -84,13 +84,13 @@ pub fn set_theme(ctx: &Context) {
     visuals.widgets.open.corner_radius = corner_radius;
 
     visuals.selection.bg_fill = ACCENT;
-    visuals.selection.stroke = Stroke::new(1.0, FG);
+    visuals.selection.stroke = Stroke::new(1.0_f32, FG);
 
     visuals.faint_bg_color = DARKER_BG;
 
     visuals.widgets.noninteractive.bg_fill = BG;
-    visuals.widgets.noninteractive.fg_stroke = Stroke::new(1.0, FG);
-    visuals.widgets.noninteractive.bg_stroke = Stroke::new(0.5, SEPARATOR_BG);
+    visuals.widgets.noninteractive.fg_stroke = Stroke::new(1.0_f32, FG);
+    visuals.widgets.noninteractive.bg_stroke = Stroke::new(0.5_f32, SEPARATOR_BG);
     visuals.widgets.noninteractive.corner_radius =
         CornerRadius::same(CORNER_RADIUS + FRAME_PADDING as u8); // Frame corner radius
 
