@@ -4,7 +4,7 @@
 #include "alvr_server/Utils.h"
 #include "alvr_server/openvr_driver_wrap.h"
 
-#include "alvr_server/Settings.h"
+#include "alvr_server/bindings.h"
 
 #include <mutex>
 
@@ -46,7 +46,7 @@ public:
 
     /** Called after Present to allow driver to take more time until vsync after they've
      * successfully acquired the sync texture in Present.*/
-    virtual void PostPresent();
+    virtual void PostPresent(const vr::IVRDriverDirectModeComponent::Throttling_t* pThrottling);
 
     void CopyTexture(uint32_t layerCount);
 
@@ -62,6 +62,7 @@ private:
         uint32_t pid;
     };
     std::map<HANDLE, std::pair<ProcessResource*, int>> m_handleMap;
+    std::map<ProcessResource*, uint32_t> m_swapchainIndices;
 
     static const int MAX_LAYERS = 10;
     int m_submitLayer;

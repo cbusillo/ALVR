@@ -4,7 +4,6 @@
 #include "Logger.h"
 #include "Paths.h"
 #include "PoseHistory.h"
-#include "Settings.h"
 #include "Utils.h"
 #include "ViveTrackerProxy.h"
 #include "bindings.h"
@@ -20,7 +19,7 @@
 Hmd::Hmd()
     : TrackedDevice(
           HEAD_ID,
-          Settings::Instance().m_TrackingRefOnly ? vr::TrackedDeviceClass_TrackingReference
+          Settings_Instance()->m_trackingRefOnly ? vr::TrackedDeviceClass_TrackingReference
                                                  : vr::TrackedDeviceClass_HMD
       )
     , m_baseComponentsInitialized(false)
@@ -29,14 +28,14 @@ Hmd::Hmd()
 
     auto dummy_fov = FfiFov { -1.0, 1.0, 1.0, -1.0 };
     auto dummy_pose = FfiPose { { 0, 0, 0, 1 }, { 0, 0, 0 } };
-    auto dummy_view_params = FfiViewParams { dummy_pose, dummy_fov };
+    auto dummy_m_viewParams = FfiViewParams { dummy_pose, dummy_fov };
 
-    this->view_params[0] = dummy_view_params;
-    this->view_params[1] = dummy_view_params;
+    this->m_viewParams[0] = dummy_m_viewParams;
+    this->m_viewParams[1] = dummy_m_viewParams;
 
     m_poseHistory = std::make_shared<PoseHistory>();
 
-    if (Settings::Instance().m_enableViveTrackerProxy) {
+    if (Settings_Instance()->m_enableViveTrackerProxy) {
         m_viveTrackerProxy = std::make_unique<ViveTrackerProxy>(*this);
         if (!vr::VRServerDriverHost()->TrackedDeviceAdded(
                 m_viveTrackerProxy->GetSerialNumber(),
@@ -75,7 +74,7 @@ bool Hmd::activate() {
     vr_properties->SetFloatProperty(
         this->prop_container,
         vr::Prop_DisplayFrequency_Float,
-        static_cast<float>(Settings::Instance().m_refreshRate)
+        static_cast<float>(Settings_Instance()->m_refreshRate)
     );
 
     vr::VRDriverInput()->CreateBooleanComponent(this->prop_container, "/proximity", &m_proximity);
@@ -96,12 +95,12 @@ bool Hmd::activate() {
     vr::VRSettings()->SetBool(
         vr::k_pch_SteamVR_Section,
         vr::k_pch_SteamVR_EnableLinuxVulkanAsync_Bool,
-        Settings::Instance().m_enableLinuxVulkanAsyncCompute
+        Settings_Instance()->m_enableLinuxVulkanAsyncCompute
     );
     vr::VRSettings()->SetBool(
         vr::k_pch_SteamVR_Section,
         vr::k_pch_SteamVR_DisableAsyncReprojection_Bool,
-        !Settings::Instance().m_enableLinuxAsyncReprojection
+        !Settings_Instance()->m_enableLinuxAsyncReprojection
     );
 #endif
 
@@ -119,11 +118,11 @@ bool Hmd::activate() {
             // Prop_GraphicsAdapterLuid_Uint64 is only for redirect display and is ignored on direct
             // mode driver. So we can't specify an adapter for vrcompositor. m_nAdapterIndex is set
             // 0 on the dashboard.
-            if (!m_D3DRender->Initialize(Settings::Instance().m_nAdapterIndex)) {
+            if (!m_D3DRender->Initialize(Settings_Instance()->m_nAdapterIndex)) {
                 Error(
                     "Could not create graphics device for adapter %d.  Requires a minimum of two "
                     "graphics cards.\n",
-                    Settings::Instance().m_nAdapterIndex
+                    Settings_Instance()->m_nAdapterIndex
                 );
                 return false;
             }
@@ -215,7 +214,7 @@ void Hmd::OnPoseUpdated(uint64_t targetTimestampNs, FfiDeviceMotion motion) {
         vr::VRProperties()->SetFloatProperty(
             this->prop_container,
             vr::Prop_DisplayFrequency_Float,
-            static_cast<float>(Settings::Instance().m_refreshRate)
+            static_cast<float>(Settings_Instance()->m_refreshRate)
         );
     }
 #endif
@@ -270,8 +269,8 @@ void Hmd::StopStreaming() {
 void Hmd::SetViewParams(const FfiViewParams params[2]) {
     Debug("Hmd::SetViewParams");
 
-    this->view_params[0] = params[0];
-    this->view_params[1] = params[1];
+    this->m_viewParams[0] = params[0];
+    this->m_viewParams[1] = params[1];
 
     // The OpenXR spec defines the HMD position as the midpoint
     // between the eyes, so conversion to this is handled by the
@@ -305,14 +304,14 @@ void Hmd::GetWindowBounds(int32_t* pnX, int32_t* pnY, uint32_t* pnWidth, uint32_
         "Hmd::GetWindowBounds %dx%d - %dx%d\n",
         0,
         0,
-        Settings::Instance().m_renderWidth,
-        Settings::Instance().m_renderHeight
+        Settings_Instance()->m_renderWidth,
+        Settings_Instance()->m_renderHeight
     );
 
     *pnX = 0;
     *pnY = 0;
-    *pnWidth = Settings::Instance().m_renderWidth;
-    *pnHeight = Settings::Instance().m_renderHeight;
+    *pnWidth = Settings_Instance()->m_renderWidth;
+    *pnHeight = Settings_Instance()->m_renderHeight;
 }
 
 bool Hmd::IsDisplayRealDisplay() {
@@ -324,8 +323,8 @@ bool Hmd::IsDisplayRealDisplay() {
 }
 
 void Hmd::GetRecommendedRenderTargetSize(uint32_t* pnWidth, uint32_t* pnHeight) {
-    *pnWidth = Settings::Instance().m_recommendedTargetWidth / 2;
-    *pnHeight = Settings::Instance().m_recommendedTargetHeight;
+    *pnWidth = Settings_Instance()->m_recommendedTargetWidth / 2;
+    *pnHeight = Settings_Instance()->m_recommendedTargetHeight;
     Debug("Hmd::GetRecommendedRenderTargetSize %dx%d\n", *pnWidth, *pnHeight);
 }
 
@@ -333,20 +332,20 @@ void Hmd::GetEyeOutputViewport(
     vr::EVREye eEye, uint32_t* pnX, uint32_t* pnY, uint32_t* pnWidth, uint32_t* pnHeight
 ) {
     *pnY = 0;
-    *pnWidth = Settings::Instance().m_renderWidth / 2;
-    *pnHeight = Settings::Instance().m_renderHeight;
+    *pnWidth = Settings_Instance()->m_renderWidth / 2;
+    *pnHeight = Settings_Instance()->m_renderHeight;
 
     if (eEye == vr::Eye_Left) {
         *pnX = 0;
     } else {
-        *pnX = Settings::Instance().m_renderWidth / 2;
+        *pnX = Settings_Instance()->m_renderWidth / 2;
     }
 
     Debug("Hmd::GetEyeOutputViewport Eye=%d %dx%d %dx%d\n", eEye, *pnX, *pnY, *pnWidth, *pnHeight);
 }
 
 void Hmd::GetProjectionRaw(vr::EVREye eye, float* left, float* right, float* top, float* bottom) {
-    auto proj = fov_to_tangents(this->view_params[eye].fov);
+    auto proj = fov_to_tangents(this->m_viewParams[eye].fov);
     *left = proj.vTopLeft.v[0];
     *right = proj.vBottomRight.v[0];
     *top = proj.vTopLeft.v[1];
@@ -357,4 +356,12 @@ void Hmd::GetProjectionRaw(vr::EVREye eye, float* left, float* right, float* top
 
 vr::DistortionCoordinates_t Hmd::ComputeDistortion(vr::EVREye, float u, float v) {
     return { { u, v }, { u, v }, { u, v } };
+}
+
+bool Hmd::ComputeInverseDistortion(
+    vr::HmdVector2_t* pResult, vr::EVREye, uint32_t, float fU, float fV
+) {
+    pResult->v[0] = fU;
+    pResult->v[1] = fV;
+    return true;
 }

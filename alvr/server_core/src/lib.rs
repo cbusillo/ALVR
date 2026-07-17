@@ -14,11 +14,18 @@ pub use c_api::*;
 pub use logging_backend::init_logging;
 pub use tracking::HandType;
 
+pub fn compute_restart_settings_hash(
+    steamvr_hmd_init_config: &SteamvrHmdInitConfig,
+    settings: &Settings,
+) -> u64 {
+    connection::compute_restart_settings_hash(steamvr_hmd_init_config, settings)
+}
+
 use crate::connection::VideoPacket;
 use alvr_common::{
-    ConnectionState, DEVICE_ID_TO_PATH, DeviceMotion, LifecycleState, Pose, RelaxedAtomic,
-    ViewParams, dbg_server_core, error,
-    glam::Vec2,
+    ConnectionState, DEVICE_ID_TO_PATH, DeviceMotion, LifecycleState, Pose, ViewParams,
+    dbg_server_core, error,
+    glam::{UVec2, Vec2},
     parking_lot::{Mutex, RwLock},
     settings_schema::Switch,
     warn,
@@ -27,11 +34,11 @@ use alvr_events::{EventType, HapticsEvent};
 use alvr_filesystem as afs;
 use alvr_packets::{
     BatteryInfo, ButtonEntry, ClientConnectionsAction, DecoderInitializationConfig, Haptics,
-    VideoPacketHeader,
+    ServerControlPacket, VideoPacketHeader,
 };
 use alvr_server_io::ServerSessionManager;
-use alvr_session::{CodecType, OpenvrProperty, Settings};
-use alvr_sockets::StreamSender;
+use alvr_session::{CodecType, H264Profile, OpenvrProperty, Settings, SteamvrHmdInitConfig};
+use alvr_sockets::{ControlSocketSender, StreamSender};
 use bitrate::{BitrateManager, DynamicEncoderParams};
 use statistics::StatisticsManager;
 use std::{
@@ -70,12 +77,24 @@ pub fn initialize_environment(layout: afs::Layout) {
     SESSION_MANAGER.write().session_mut();
 }
 
+pub struct ServerNegotiatedStreamingConfig {
+    pub transcoding_view_resolution: UVec2,
+    pub emulated_headset_view_resolution: UVec2,
+    pub refresh_rate: f32,
+    pub enable_foveated_encoding: bool,
+    pub codec: CodecType,
+    pub h264_profile: H264Profile,
+    pub use_10bit_encoder: bool,
+    pub encoding_gamma: f32,
+    pub enable_hdr: bool,
+}
+
 pub enum ServerCoreEvent {
     SetOpenvrProperty {
         device_id: u64,
         prop: OpenvrProperty,
     },
-    ClientConnected,
+    ClientConnected(ServerNegotiatedStreamingConfig),
     ClientDisconnected,
     Battery(BatteryInfo),
     PlayspaceSync(Vec2),
@@ -83,6 +102,7 @@ pub enum ServerCoreEvent {
     Tracking {
         poll_timestamp: Duration,
     },
+    RawButtons(Vec<ButtonEntry>),
     Buttons(Vec<ButtonEntry>), // Note: this is after mapping
     RequestIDR,
     CaptureFrame,
@@ -102,6 +122,7 @@ pub struct ConnectionContext {
     video_recording_file: Mutex<Option<File>>,
     connection_threads: Mutex<Vec<JoinHandle<()>>>,
     clients_to_be_removed: Mutex<HashSet<String>>,
+    control_sender: Mutex<Option<Arc<Mutex<ControlSocketSender<ServerControlPacket>>>>>,
     video_channel_sender: Mutex<Option<SyncSender<VideoPacket>>>,
     haptics_sender: Mutex<Option<StreamSender<Haptics>>>,
 }
@@ -154,6 +175,14 @@ pub fn settings() -> Settings {
     SESSION_MANAGER.read().settings().clone()
 }
 
+pub fn steamvr_hmd_init_config() -> SteamvrHmdInitConfig {
+    SESSION_MANAGER
+        .read()
+        .session()
+        .steamvr_hmd_init_config
+        .clone()
+}
+
 pub fn registered_button_set() -> HashSet<u64> {
     let session_manager = SESSION_MANAGER.read();
     if let Switch::Enabled(input_mapping) = &session_manager.settings().headset.controllers {
@@ -165,7 +194,6 @@ pub fn registered_button_set() -> HashSet<u64> {
 
 pub struct ServerCoreContext {
     lifecycle_state: Arc<RwLock<LifecycleState>>,
-    is_restarting: RelaxedAtomic,
     connection_context: Arc<ConnectionContext>,
     connection_thread: Arc<RwLock<Option<JoinHandle<()>>>>,
     webserver_runtime: Option<Runtime>,
@@ -213,6 +241,7 @@ impl ServerCoreContext {
             video_recording_file: Mutex::new(None),
             connection_threads: Mutex::new(Vec::new()),
             clients_to_be_removed: Mutex::new(HashSet::new()),
+            control_sender: Mutex::new(None),
             video_channel_sender: Mutex::new(None),
             haptics_sender: Mutex::new(None),
         });
@@ -226,9 +255,7 @@ impl ServerCoreContext {
         (
             Self {
                 lifecycle_state: Arc::new(RwLock::new(LifecycleState::StartingUp)),
-                is_restarting: RelaxedAtomic::new(false),
                 connection_context,
-
                 connection_thread: Arc::new(RwLock::new(None)),
                 webserver_runtime: Some(webserver_runtime),
             },
@@ -357,11 +384,21 @@ impl ServerCoreContext {
             file.write_all(&config_buffer).ok();
         }
 
-        *self.connection_context.decoder_config.lock() = Some(DecoderInitializationConfig {
+        let config = DecoderInitializationConfig {
             codec,
             config_buffer,
             ext_str: String::new(),
-        });
+        };
+        *self.connection_context.decoder_config.lock() = Some(config.clone());
+
+        let control_sender = self.connection_context.control_sender.lock().clone();
+        if let Some(sender) = control_sender
+            && let Err(error) = sender
+                .lock()
+                .send(&ServerControlPacket::DecoderConfig(config))
+        {
+            warn!("Failed to send decoder configuration: {error}");
+        }
     }
 
     pub fn send_video_nal(
@@ -370,7 +407,7 @@ impl ServerCoreContext {
         global_view_params: [ViewParams; 2],
         is_idr: bool,
         nal_buffer: Vec<u8>,
-    ) {
+    ) -> bool {
         dbg_server_core!("send_video_nal");
 
         // start in the corrupts state, the client didn't receive the initial IDR yet.
@@ -378,7 +415,12 @@ impl ServerCoreContext {
         static LAST_IDR_INSTANT: LazyLock<Mutex<Instant>> =
             LazyLock::new(|| Mutex::new(Instant::now()));
 
-        if let Some(sender) = &*self.connection_context.video_channel_sender.lock() {
+        let sender_guard = self.connection_context.video_channel_sender.lock();
+        let Some(sender) = sender_guard.as_ref() else {
+            return false;
+        };
+        let mut enqueued = false;
+        {
             let buffer_size = nal_buffer.len();
 
             if is_idr {
@@ -431,13 +473,19 @@ impl ServerCoreContext {
                     },
                     payload: nal_buffer,
                 });
-                if matches!(sender_result, Err(TrySendError::Full(_))) {
-                    STREAM_CORRUPTED.store(true, Ordering::SeqCst);
-                    self.connection_context
-                        .events_sender
-                        .send(ServerCoreEvent::RequestIDR)
-                        .ok();
-                    warn!("Dropping video packet. Reason: Can't push to network");
+                match sender_result {
+                    Ok(()) => enqueued = true,
+                    Err(TrySendError::Full(_)) => {
+                        STREAM_CORRUPTED.store(true, Ordering::SeqCst);
+                        self.connection_context
+                            .events_sender
+                            .send(ServerCoreEvent::RequestIDR)
+                            .ok();
+                        warn!("Dropping video packet. Reason: Can't push to network");
+                    }
+                    Err(TrySendError::Disconnected(_)) => {
+                        warn!("Dropping video packet. Reason: Video channel disconnected");
+                    }
                 }
             } else {
                 warn!("Dropping video packet. Reason: Waiting for IDR frame");
@@ -452,6 +500,7 @@ impl ServerCoreContext {
                     .report_frame_encoded(timestamp, encoder_latency, buffer_size);
             }
         }
+        enqueued
     }
 
     pub fn get_dynamic_encoder_params(&self) -> Option<DynamicEncoderParams> {
@@ -465,15 +514,12 @@ impl ServerCoreContext {
                 .get_encoder_params(&session_manager_lock.settings().video.bitrate)
         };
 
-        if let Some((params, stats)) = pair {
+        pair.map(|(params, stats)| {
             if let Some(stats_manager) = &mut *self.connection_context.statistics_manager.write() {
                 stats_manager.report_throughput_stats(stats);
             }
-
-            Some(params)
-        } else {
-            None
-        }
+            params
+        })
     }
 
     pub fn report_composed(&self, target_timestamp: Duration, offset: Duration) {
@@ -512,14 +558,6 @@ impl ServerCoreContext {
             .write()
             .as_mut()
             .map(|stats| stats.duration_until_next_vsync())
-    }
-
-    pub fn restart(self) {
-        dbg_server_core!("restart");
-
-        self.is_restarting.set(true);
-
-        // drop is called here for self
     }
 }
 
@@ -560,11 +598,19 @@ impl Drop for ServerCoreContext {
         }
 
         // apply openvr config for the next launch
-        dbg_server_core!("Setting restart settings chache");
+        dbg_server_core!("Setting restart settings cache");
         {
             let mut session_manager_lock = SESSION_MANAGER.write();
-            session_manager_lock.session_mut().openvr_config =
-                connection::contruct_openvr_config(session_manager_lock.session());
+            let new_steamvr_hmd_init_config = session_manager_lock
+                .session()
+                .steamvr_hmd_init_config
+                .clone();
+            let settings = session_manager_lock.session().to_settings();
+            let new_hash =
+                connection::compute_restart_settings_hash(&new_steamvr_hmd_init_config, &settings);
+            let mut session = session_manager_lock.session_mut();
+            session.steamvr_hmd_init_config = new_steamvr_hmd_init_config;
+            session.restart_settings_hash = new_hash;
         }
 
         // todo: check if this is still needed

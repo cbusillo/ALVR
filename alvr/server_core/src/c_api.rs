@@ -2,7 +2,8 @@
 #![allow(clippy::missing_safety_doc)]
 
 use crate::{
-    SESSION_MANAGER, ServerCoreContext, ServerCoreEvent, logging_backend, tracking::HandType,
+    SESSION_MANAGER, ServerCoreContext, ServerCoreEvent, ServerNegotiatedStreamingConfig,
+    logging_backend, tracking::HandType,
 };
 use alvr_common::{
     AlvrCodecType, AlvrPose, AlvrViewParams, log,
@@ -23,6 +24,7 @@ use std::{
 static SERVER_CORE_CONTEXT: RwLock<Option<ServerCoreContext>> = RwLock::new(None);
 static EVENTS_RECEIVER: Mutex<Option<mpsc::Receiver<ServerCoreEvent>>> = Mutex::new(None);
 static BUTTONS_QUEUE: Mutex<VecDeque<Vec<ButtonEntry>>> = Mutex::new(VecDeque::new());
+static NEGOTIATED_CONFIG: Mutex<Option<ServerNegotiatedStreamingConfig>> = Mutex::new(None);
 
 #[repr(C)]
 pub struct AlvrDeviceMotion {
@@ -94,6 +96,19 @@ pub struct AlvrDynamicEncoderParams {
     framerate: f32,
 }
 
+#[repr(C)]
+pub struct AlvrNegotiatedConfig {
+    pub view_resolution: [u32; 2],
+    pub target_view_resolution: [u32; 2],
+    pub refresh_rate: f32,
+    pub enable_foveated_encoding: bool,
+    pub codec: AlvrCodecType,
+    pub h264_profile: u32,
+    pub use_10bit_encoder: bool,
+    pub encoding_gamma: f32,
+    pub enable_hdr: bool,
+}
+
 fn string_to_c_str(buffer: *mut c_char, value: &str) -> u64 {
     let cstring = CString::new(value).unwrap();
     if !buffer.is_null() {
@@ -105,11 +120,13 @@ fn string_to_c_str(buffer: *mut c_char, value: &str) -> u64 {
     cstring.as_bytes_with_nul().len() as u64
 }
 
+static SERVER_START_INSTANT: LazyLock<Instant> = LazyLock::new(Instant::now);
+
 // Get ALVR server time. The libalvr user should provide timestamps in the provided time frame of
 // reference in the following functions
 #[unsafe(no_mangle)]
 pub extern "C" fn alvr_get_time_ns() -> u64 {
-    Instant::now().elapsed().as_nanos() as u64
+    SERVER_START_INSTANT.elapsed().as_nanos() as u64
 }
 
 // The libalvr user is responsible of interpreting values and calling functions using
@@ -162,13 +179,13 @@ pub unsafe extern "C" fn alvr_dbg_encoder(string_ptr: *const c_char) {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn alvr_log_periodically(tag_ptr: *const c_char, message_ptr: *const c_char) {
     const INTERVAL: Duration = Duration::from_secs(1);
-    static LASTEST_TAG_TIMESTAMPS: LazyLock<Mutex<HashMap<String, Instant>>> =
+    static LATEST_TAG_TIMESTAMPS: LazyLock<Mutex<HashMap<String, Instant>>> =
         LazyLock::new(|| Mutex::new(HashMap::new()));
 
     let tag = unsafe { CStr::from_ptr(tag_ptr) }.to_string_lossy();
     let message = unsafe { CStr::from_ptr(message_ptr) }.to_string_lossy();
 
-    let mut timestamps_ref = LASTEST_TAG_TIMESTAMPS.lock();
+    let mut timestamps_ref = LATEST_TAG_TIMESTAMPS.lock();
     let old_timestamp = timestamps_ref
         .entry(tag.to_string())
         .or_insert_with(Instant::now);
@@ -182,6 +199,14 @@ pub unsafe extern "C" fn alvr_log_periodically(tag_ptr: *const c_char, message_p
 #[unsafe(no_mangle)]
 pub extern "C" fn alvr_get_settings_json(buffer: *mut c_char) -> u64 {
     string_to_c_str(buffer, &serde_json::to_string(&crate::settings()).unwrap())
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn alvr_get_steamvr_hmd_init_config_json(buffer: *mut c_char) -> u64 {
+    string_to_c_str(
+        buffer,
+        &serde_json::to_string(&crate::steamvr_hmd_init_config()).unwrap(),
+    )
 }
 
 /// This must be called before alvr_initialize()
@@ -230,7 +255,7 @@ pub extern "C" fn alvr_initialize() -> AlvrTargetConfig {
     *EVENTS_RECEIVER.lock() = Some(receiver);
 
     let session_manager_lock = SESSION_MANAGER.read();
-    let restart_settings = &session_manager_lock.session().openvr_config;
+    let restart_settings = &session_manager_lock.session().steamvr_hmd_init_config;
 
     AlvrTargetConfig {
         game_render_width: restart_settings.target_eye_resolution_width,
@@ -253,7 +278,8 @@ pub unsafe extern "C" fn alvr_poll_event(out_event: *mut AlvrEvent, timeout_ns: 
         && let Ok(event) = receiver.recv_timeout(Duration::from_nanos(timeout_ns))
     {
         match event {
-            ServerCoreEvent::ClientConnected => unsafe {
+            ServerCoreEvent::ClientConnected(config) => unsafe {
+                *NEGOTIATED_CONFIG.lock() = Some(config);
                 *out_event = AlvrEvent::ClientConnected;
             },
             ServerCoreEvent::ClientDisconnected => unsafe {
@@ -292,7 +318,8 @@ pub unsafe extern "C" fn alvr_poll_event(out_event: *mut AlvrEvent, timeout_ns: 
             ServerCoreEvent::ShutdownPending => unsafe {
                 *out_event = AlvrEvent::ShutdownPending;
             },
-            ServerCoreEvent::GameRenderLatencyFeedback(_)
+            ServerCoreEvent::RawButtons(_)
+            | ServerCoreEvent::GameRenderLatencyFeedback(_)
             | ServerCoreEvent::SetOpenvrProperty { .. } => {} // implementation not needed
             ServerCoreEvent::ProximityState(headset_is_worn) => unsafe {
                 *out_event = AlvrEvent::ProximityState(headset_is_worn);
@@ -380,6 +407,38 @@ pub unsafe extern "C" fn alvr_get_buttons(out_entries: *mut AlvrButtonEntry) -> 
         entries_count
     } else {
         0
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn alvr_get_negotiated_config(out_config: *mut AlvrNegotiatedConfig) -> bool {
+    if let Some(config) = &*NEGOTIATED_CONFIG.lock() {
+        unsafe {
+            *out_config = AlvrNegotiatedConfig {
+                view_resolution: [
+                    config.transcoding_view_resolution.x,
+                    config.transcoding_view_resolution.y,
+                ],
+                target_view_resolution: [
+                    config.emulated_headset_view_resolution.x,
+                    config.emulated_headset_view_resolution.y,
+                ],
+                refresh_rate: config.refresh_rate,
+                enable_foveated_encoding: config.enable_foveated_encoding,
+                codec: match config.codec {
+                    CodecType::H264 => AlvrCodecType::H264,
+                    CodecType::Hevc => AlvrCodecType::Hevc,
+                    CodecType::AV1 => AlvrCodecType::AV1,
+                },
+                h264_profile: config.h264_profile as u32,
+                use_10bit_encoder: config.use_10bit_encoder,
+                encoding_gamma: config.encoding_gamma,
+                enable_hdr: config.enable_hdr,
+            }
+        };
+        true
+    } else {
+        false
     }
 }
 
@@ -490,7 +549,7 @@ pub extern "C" fn alvr_report_present(timestamp_ns: u64, offset_ns: u64) {
     }
 }
 
-/// Retr  un true if a valid value is provided
+/// Return true if a valid value is provided
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn alvr_duration_until_next_vsync(out_ns: *mut u64) -> bool {
     if let Some(context) = &*SERVER_CORE_CONTEXT.read()
@@ -501,13 +560,6 @@ pub unsafe extern "C" fn alvr_duration_until_next_vsync(out_ns: *mut u64) -> boo
         true
     } else {
         false
-    }
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn alvr_restart() {
-    if let Some(context) = SERVER_CORE_CONTEXT.write().take() {
-        context.restart();
     }
 }
 
