@@ -378,6 +378,7 @@ static uint32_t find_nonblack_sample(IOSurfaceRef surface,
     size_t height = IOSurfaceGetHeight(surface);
     size_t bytes_per_row;
 
+    memset(actual_bgra, 0, 4);
     if (IOSurfaceLock(surface, kIOSurfaceLockReadOnly, NULL) != kIOReturnSuccess)
         return ALVR_IOSURFACE_PROBE_LOCK_FAILED;
     base = IOSurfaceGetBaseAddress(surface);
@@ -415,7 +416,7 @@ static uint32_t find_nonblack_sample(IOSurfaceRef surface,
         }
     }
     IOSurfaceUnlock(surface, kIOSurfaceLockReadOnly, NULL);
-    return ALVR_IOSURFACE_PROBE_PIXEL_MISMATCH;
+    return ALVR_IOSURFACE_PROBE_PASS;
 }
 
 void *alvr_native_source_create(const char *service_name,

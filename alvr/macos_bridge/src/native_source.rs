@@ -10,8 +10,10 @@ use std::{
 };
 
 const ERROR_CAPACITY: usize = 512;
+const VISIBLE_COLOR_THRESHOLD: u32 = 96;
 pub const SOURCE_SLOT_COUNT: usize = 3;
 pub const FRAME_FLAG_SELF_TEST: u32 = 1;
+pub const FRAME_FLAG_CONSUMER_SAMPLE: u32 = 1 << 1;
 pub const FRAME_FLAG_FALLBACK_POSE: u32 = 1 << 2;
 pub const FRAME_FLAG_STARTUP_BARRIER: u32 = 1 << 3;
 pub const STATUS_PASS: u32 = 0;
@@ -228,6 +230,14 @@ impl NativeSourceFrame<'_> {
         self.raw.flags & FRAME_FLAG_SELF_TEST != 0
     }
 
+    pub fn is_consumer_sample(&self) -> bool {
+        self.raw.flags & FRAME_FLAG_CONSUMER_SAMPLE != 0
+    }
+
+    pub fn is_visible_consumer_sample(&self) -> bool {
+        is_visible_consumer_sample(&self.raw)
+    }
+
     pub fn is_fallback_pose(&self) -> bool {
         self.raw.flags & FRAME_FLAG_FALLBACK_POSE != 0
     }
@@ -298,6 +308,15 @@ fn error_message(buffer: &[c_char]) -> String {
         .into_owned()
 }
 
+fn is_visible_consumer_sample(frame: &RawSourceFrame) -> bool {
+    frame.flags & FRAME_FLAG_CONSUMER_SAMPLE != 0
+        && frame.actual_bgra[..3]
+            .iter()
+            .map(|component| u32::from(*component))
+            .sum::<u32>()
+            >= VISIBLE_COLOR_THRESHOLD
+}
+
 fn pose_from_matrix34(matrix: [[f32; 4]; 3]) -> Pose {
     let rotation = Mat3::from_cols(
         Vec3::new(matrix[0][0], matrix[1][0], matrix[2][0]),
@@ -325,5 +344,27 @@ mod tests {
         assert_eq!(pose.position, Vec3::new(1.0, 2.0, 3.0));
         assert!(pose.orientation.is_finite());
         assert!((pose.orientation.length_squared() - 1.0).abs() < 0.0001);
+    }
+
+    #[test]
+    fn classifies_visible_consumer_samples_by_rgb_only() {
+        let visible = RawSourceFrame {
+            flags: FRAME_FLAG_CONSUMER_SAMPLE,
+            actual_bgra: [32, 32, 32, 0],
+            ..Default::default()
+        };
+        assert!(is_visible_consumer_sample(&visible));
+
+        let alpha_only = RawSourceFrame {
+            actual_bgra: [0, 0, 0, 255],
+            ..visible
+        };
+        assert!(!is_visible_consumer_sample(&alpha_only));
+
+        let metadata_only = RawSourceFrame {
+            flags: 0,
+            ..visible
+        };
+        assert!(!is_visible_consumer_sample(&metadata_only));
     }
 }
