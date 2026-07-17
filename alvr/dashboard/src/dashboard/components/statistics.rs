@@ -16,7 +16,7 @@ const GRAPH_HISTORY_SIZE: usize = 1000;
 const UPPER_QUANTILE: f64 = 0.90;
 
 fn draw_lines(painter: &Painter, points: Vec<Pos2>, color: Color32) {
-    painter.add(Shape::line(points, Stroke::new(1.0, color)));
+    painter.add(Shape::line(points, Stroke::new(1.0_f32, color)));
 }
 
 pub struct StatisticsTab {
