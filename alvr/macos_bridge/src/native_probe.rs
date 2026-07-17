@@ -79,6 +79,8 @@ pub struct NativeCadenceReport {
     pub dropped: u64,
     pub not_ready_drops: u64,
     pub pool_exhausted_drops: u64,
+    pub black_consumer_samples: u64,
+    pub visible_consumer_samples: u64,
     pub pose_paired: u64,
     pub pose_fallback: u64,
     pub pose_bootstrap: u64,
@@ -95,7 +97,7 @@ impl fmt::Display for NativeCadenceReport {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             formatter,
-            "native_source cadence received={} submitted={} encoded={} alvr_sent={} encoded_bytes={} transported_bytes={} encoded_mbps={:.3} keyframes={} keyframe_bytes={} max_frame_bytes={} video_span_ms={} dropped={} not_ready_drops={} pool_exhausted_drops={} pose_paired={} pose_fallback={} pose_bootstrap={} pose_generation_gaps={} pose_timestamp_reuses={} conversion_avg_us={} conversion_max_us={} conversion_gpu_avg_us={} conversion_gpu_max_us={} pool_available={}",
+            "native_source cadence received={} submitted={} encoded={} alvr_sent={} encoded_bytes={} transported_bytes={} encoded_mbps={:.3} keyframes={} keyframe_bytes={} max_frame_bytes={} video_span_ms={} dropped={} not_ready_drops={} pool_exhausted_drops={} black_consumer_samples={} visible_consumer_samples={} pose_paired={} pose_fallback={} pose_bootstrap={} pose_generation_gaps={} pose_timestamp_reuses={} conversion_avg_us={} conversion_max_us={} conversion_gpu_avg_us={} conversion_gpu_max_us={} pool_available={}",
             self.received,
             self.submitted,
             self.encoded,
@@ -110,6 +112,8 @@ impl fmt::Display for NativeCadenceReport {
             self.dropped,
             self.not_ready_drops,
             self.pool_exhausted_drops,
+            self.black_consumer_samples,
+            self.visible_consumer_samples,
             self.pose_paired,
             self.pose_fallback,
             self.pose_bootstrap,
@@ -141,6 +145,8 @@ pub struct NativeProbeSummary {
     pub dropped_frames: u64,
     pub not_ready_drops: u64,
     pub pool_exhausted_drops: u64,
+    pub black_consumer_samples: u64,
+    pub visible_consumer_samples: u64,
     pub pose_paired: u64,
     pub pose_fallback: u64,
     pub pose_bootstrap: u64,
@@ -161,7 +167,7 @@ impl fmt::Display for NativeProbeSummary {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             formatter,
-            "native_source summary self_tests={} received={} submitted={} encoded={} alvr_sent={} encoded_bytes={} transported_bytes={} encoded_mbps={:.3} keyframes={} keyframe_bytes={} max_frame_bytes={} video_span_ms={} dropped={} not_ready_drops={} pool_exhausted_drops={} pose_paired={} pose_fallback={} pose_bootstrap={} pose_generation_gaps={} pose_timestamp_reuses={} last_pose_generation={} wall_ms={} conversion_avg_us={} conversion_max_us={} conversion_gpu_avg_us={} conversion_gpu_max_us={} pool_available={}/{} leases_acquired={} leases_recycled={} hardware_hevc={} alvr_connected={}",
+            "native_source summary self_tests={} received={} submitted={} encoded={} alvr_sent={} encoded_bytes={} transported_bytes={} encoded_mbps={:.3} keyframes={} keyframe_bytes={} max_frame_bytes={} video_span_ms={} dropped={} not_ready_drops={} pool_exhausted_drops={} black_consumer_samples={} visible_consumer_samples={} pose_paired={} pose_fallback={} pose_bootstrap={} pose_generation_gaps={} pose_timestamp_reuses={} last_pose_generation={} wall_ms={} conversion_avg_us={} conversion_max_us={} conversion_gpu_avg_us={} conversion_gpu_max_us={} pool_available={}/{} leases_acquired={} leases_recycled={} hardware_hevc={} alvr_connected={}",
             self.self_tests,
             self.received_frames,
             self.submitted_frames,
@@ -177,6 +183,8 @@ impl fmt::Display for NativeProbeSummary {
             self.dropped_frames,
             self.not_ready_drops,
             self.pool_exhausted_drops,
+            self.black_consumer_samples,
+            self.visible_consumer_samples,
             self.pose_paired,
             self.pose_fallback,
             self.pose_bootstrap,
@@ -335,6 +343,8 @@ pub fn run_native_source_probe(
     let mut dropped = 0;
     let mut not_ready_drops = 0;
     let mut pool_exhausted_drops = 0;
+    let mut black_consumer_samples = 0;
+    let mut visible_consumer_samples = 0;
     let mut pose_paired = 0;
     let mut pose_fallback = 0;
     let mut pose_bootstrap = 0;
@@ -372,6 +382,8 @@ pub fn run_native_source_probe(
                 dropped,
                 not_ready_drops,
                 pool_exhausted_drops,
+                black_consumer_samples,
+                visible_consumer_samples,
                 pose_paired,
                 pose_fallback,
                 pose_bootstrap,
@@ -434,6 +446,8 @@ pub fn run_native_source_probe(
                 "IOSurface frame {frame_id} slot={slot_index} generation={generation} failed validation status={validation_status} expected={expected:?} actual={actual:?}"
             );
         }
+        let consumer_sample = frame.is_consumer_sample();
+        let visible_consumer_sample = frame.is_visible_consumer_sample();
         if frame.is_self_test() {
             frame.release(STATUS_COPY_FAILED)?;
             anyhow::bail!("received a duplicate IOSurface self-test after startup completed");
@@ -549,6 +563,16 @@ pub fn run_native_source_probe(
         last_submitted_video_timestamp = Some(metadata.video_timestamp);
         let outputs = encoder.submit(lease, metadata, force_keyframe)?;
         submitted += 1;
+        if consumer_sample {
+            if visible_consumer_sample {
+                visible_consumer_samples += 1;
+            } else {
+                black_consumer_samples += 1;
+                println!(
+                    "native_source black consumer sample submitted frame_id={frame_id} count={black_consumer_samples}"
+                );
+            }
+        }
         let dispatch = dispatch_outputs(outputs, &mut sink)?;
         encoded += dispatch.encoded;
         transported += dispatch.transported;
@@ -596,6 +620,10 @@ pub fn run_native_source_probe(
         pool_stats.acquired,
         pool_stats.recycled
     );
+    ensure!(
+        visible_content_observed(black_consumer_samples, visible_consumer_samples),
+        "consumer sampling never observed visible content: black_samples={black_consumer_samples}"
+    );
     let connected_to_alvr = sink.as_mut().is_some_and(|sink| {
         sink.poll_events();
         sink.ever_connected()
@@ -629,6 +657,8 @@ pub fn run_native_source_probe(
         dropped_frames: dropped,
         not_ready_drops,
         pool_exhausted_drops,
+        black_consumer_samples,
+        visible_consumer_samples,
         pose_paired,
         pose_fallback,
         pose_bootstrap,
@@ -671,6 +701,10 @@ fn normalized_megabits_per_second(bytes: u64, frames: u64, fps: u32) -> f64 {
     }
 }
 
+fn visible_content_observed(black_samples: u64, visible_samples: u64) -> bool {
+    black_samples + visible_samples == 0 || visible_samples > 0
+}
+
 fn env_u32(name: &str, default: u32) -> Result<u32> {
     env::var(name).map_or(Ok(default), |value| {
         value.parse().with_context(|| format!("invalid {name}"))
@@ -703,5 +737,12 @@ mod tests {
     fn reports_encoded_megabits_per_second() {
         assert!((normalized_megabits_per_second(50_000, 72, 90) - 0.5).abs() < 0.001);
         assert_eq!(normalized_megabits_per_second(50_000, 0, 90), 0.0);
+    }
+
+    #[test]
+    fn requires_eventual_visibility_after_consumer_sampling_starts() {
+        assert!(visible_content_observed(0, 0));
+        assert!(!visible_content_observed(2, 0));
+        assert!(visible_content_observed(2, 1));
     }
 }
