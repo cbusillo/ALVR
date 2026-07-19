@@ -2,6 +2,7 @@
 #include <bsm/libbsm.h>
 #include <CoreFoundation/CoreFoundation.h>
 #include <IOSurface/IOSurface.h>
+#include <libproc.h>
 #include <mach/mach.h>
 #include <math.h>
 #include <stdbool.h>
@@ -95,11 +96,16 @@ struct alvr_native_source
     uint32_t width;
     uint32_t height;
     uint32_t producer_pid;
+    uint32_t producer_pidversion;
+    uint64_t producer_start_token;
     mach_port_t receive_port;
     struct source_slot slots[source_slot_count];
 };
 
 void alvr_native_source_destroy(void *opaque_source);
+uint32_t alvr_native_source_producer_pid(void *opaque_source);
+uint32_t alvr_native_source_producer_pidversion(void *opaque_source);
+uint64_t alvr_native_source_producer_start_token(void *opaque_source);
 
 static void set_error(char *buffer, size_t capacity, const char *message)
 {
@@ -251,6 +257,27 @@ static pid_t message_sender_pid(const mach_msg_header_t *header)
     return audit_token_to_pid(trailer->msgh_audit);
 }
 
+static uint32_t message_sender_pidversion(const mach_msg_header_t *header)
+{
+    const mach_msg_audit_trailer_t *trailer =
+        (const mach_msg_audit_trailer_t *)((const uint8_t *)header +
+                                           round_msg(header->msgh_size));
+    if (trailer->msgh_trailer_type != MACH_MSG_TRAILER_FORMAT_0 ||
+        trailer->msgh_trailer_size < sizeof(*trailer))
+        return 0;
+    return (uint32_t)audit_token_to_pidversion(trailer->msgh_audit);
+}
+
+static uint64_t process_start_token(pid_t pid)
+{
+    struct proc_bsdinfo info = {0};
+    const int size = proc_pidinfo(
+        pid, PROC_PIDTBSDINFO, 0, &info, sizeof(info));
+
+    if (size != sizeof(info) || info.pbi_pid != (uint32_t)pid) return 0;
+    return info.pbi_start_tvsec * UINT64_C(1000000) + info.pbi_start_tvusec;
+}
+
 static bool has_send_once_reply(const mach_msg_header_t *header)
 {
     return header->msgh_remote_port != MACH_PORT_NULL &&
@@ -261,19 +288,29 @@ static bool has_send_once_reply(const mach_msg_header_t *header)
 static const char *import_request_rejection_reason(
     const struct alvr_native_source *source,
     const struct request_message *request,
-    pid_t sender_pid)
+    pid_t sender_pid,
+    uint32_t sender_pidversion,
+    uint64_t sender_start_token)
 {
     if (request->header.msgh_size != sizeof(*request)) return "message-size";
     if (request->header.msgh_bits & MACH_MSGH_BITS_COMPLEX) return "complex-message";
     if (request->header.msgh_id != ALVR_IOSURFACE_MESSAGE_REQUEST) return "message-id";
     if (!has_send_once_reply(&request->header)) return "reply-right";
     if (sender_pid <= 0) return "audit-pid";
+    if (!sender_pidversion) return "audit-pidversion";
+    if (!sender_start_token) return "process-start-token";
     if (request->payload.protocol_version != ALVR_IOSURFACE_PROTOCOL_VERSION)
         return "protocol-version";
     if (request->payload.session_nonce != source->session_nonce) return "session-nonce";
     if (request->payload.client_pid != (uint32_t)sender_pid) return "client-pid";
     if (source->producer_pid && (uint32_t)sender_pid != source->producer_pid)
         return "producer-pid";
+    if (source->producer_pidversion &&
+        sender_pidversion != source->producer_pidversion)
+        return "producer-pidversion";
+    if (source->producer_start_token &&
+        sender_start_token != source->producer_start_token)
+        return "producer-start-token";
     return NULL;
 }
 
@@ -296,7 +333,8 @@ static kern_return_t receive_message(mach_port_t port,
 static kern_return_t send_offer(
     mach_port_t reply_port,
     mach_port_t surface_port,
-    const struct alvr_iosurface_offer *offer)
+    const struct alvr_iosurface_offer *offer,
+    mach_msg_timeout_t timeout_ms)
 {
     struct offer_message message = {0};
     kern_return_t result;
@@ -317,7 +355,7 @@ static kern_return_t send_offer(
                       message.header.msgh_size,
                       0,
                       MACH_PORT_NULL,
-                      import_send_timeout_ms,
+                      timeout_ms,
                       MACH_PORT_NULL);
     if (result != KERN_SUCCESS) deallocate_port(&reply_port);
     return result;
@@ -479,6 +517,8 @@ int alvr_native_source_accept(void *opaque_source,
                               size_t error_capacity)
 {
     struct alvr_native_source *source = opaque_source;
+    const uint64_t started_ms = monotonic_milliseconds();
+    const uint64_t deadline_ms = started_ms ? started_ms + timeout_ms : 0;
 
     if (!source)
     {
@@ -491,8 +531,8 @@ int alvr_native_source_accept(void *opaque_source,
         mach_port_t surface_port = MACH_PORT_NULL;
         kern_return_t result;
         pid_t sender_pid = -1;
-        const uint64_t started_ms = monotonic_milliseconds();
-        const uint64_t deadline_ms = started_ms ? started_ms + timeout_ms : 0;
+        uint32_t sender_pidversion = 0;
+        uint64_t sender_start_token = 0;
 
         for (;;)
         {
@@ -523,8 +563,14 @@ int alvr_native_source_accept(void *opaque_source,
                 return -2;
             }
             sender_pid = message_sender_pid(&received.request.header);
+            sender_pidversion = message_sender_pidversion(&received.request.header);
+            sender_start_token = process_start_token(sender_pid);
             rejection_reason = import_request_rejection_reason(
-                source, &received.request, sender_pid);
+                source,
+                &received.request,
+                sender_pid,
+                sender_pidversion,
+                sender_start_token);
             if (!rejection_reason) break;
 
             fprintf(stderr,
@@ -538,6 +584,8 @@ int alvr_native_source_accept(void *opaque_source,
             mach_msg_destroy(&received.request.header);
         }
         source->producer_pid = (uint32_t)sender_pid;
+        source->producer_pidversion = sender_pidversion;
+        source->producer_start_token = sender_start_token;
 
         surface_port = IOSurfaceCreateMachPort(
             source->slots[slot_index].surface);
@@ -548,6 +596,17 @@ int alvr_native_source_accept(void *opaque_source,
             return -4;
         }
         struct alvr_iosurface_offer offer = {0};
+        const mach_msg_timeout_t send_timeout = deadline_ms
+            ? remaining_timeout(deadline_ms, import_send_timeout_ms)
+            : import_send_timeout_ms;
+        if (!send_timeout)
+        {
+            deallocate_port(&received.request.header.msgh_remote_port);
+            deallocate_port(&surface_port);
+            set_mach_error(
+                error_buffer, error_capacity, "offer send", MACH_SEND_TIMED_OUT);
+            return -5;
+        }
         offer.session_nonce = source->session_nonce;
         offer.frame_id = slot_index + 1;
         offer.protocol_version = ALVR_IOSURFACE_PROTOCOL_VERSION;
@@ -561,7 +620,10 @@ int alvr_native_source_accept(void *opaque_source,
             source->slots[slot_index].surface);
         offer.producer_pid = getpid();
         result = send_offer(
-            received.request.header.msgh_remote_port, surface_port, &offer);
+            received.request.header.msgh_remote_port,
+            surface_port,
+            &offer,
+            send_timeout);
         received.request.header.msgh_remote_port = MACH_PORT_NULL;
         deallocate_port(&surface_port);
         if (result != KERN_SUCCESS)
@@ -571,6 +633,27 @@ int alvr_native_source_accept(void *opaque_source,
         }
     }
     return 0;
+}
+
+uint32_t alvr_native_source_producer_pid(void *opaque_source)
+{
+    struct alvr_native_source *source = opaque_source;
+
+    return source ? source->producer_pid : 0;
+}
+
+uint32_t alvr_native_source_producer_pidversion(void *opaque_source)
+{
+    struct alvr_native_source *source = opaque_source;
+
+    return source ? source->producer_pidversion : 0;
+}
+
+uint64_t alvr_native_source_producer_start_token(void *opaque_source)
+{
+    struct alvr_native_source *source = opaque_source;
+
+    return source ? source->producer_start_token : 0;
 }
 
 int alvr_native_source_next_frame(void *opaque_source,
@@ -589,6 +672,7 @@ int alvr_native_source_next_frame(void *opaque_source,
     bool self_test;
     bool startup_barrier;
     pid_t sender_pid;
+    uint32_t sender_pidversion;
     const uint64_t started_ms = monotonic_milliseconds();
     const uint64_t deadline_ms = started_ms ? started_ms + timeout_ms : 0;
 
@@ -621,6 +705,7 @@ int alvr_native_source_next_frame(void *opaque_source,
             return -2;
         }
         sender_pid = message_sender_pid(&received.frame.header);
+        sender_pidversion = message_sender_pidversion(&received.frame.header);
         if (received.frame.header.msgh_size != sizeof(struct frame_ready_message))
             rejection_reason = "message-size";
         else if (received.frame.header.msgh_bits & MACH_MSGH_BITS_COMPLEX)
@@ -634,14 +719,18 @@ int alvr_native_source_next_frame(void *opaque_source,
             rejection_reason = "audit-pid";
         else if ((uint32_t)sender_pid != source->producer_pid)
             rejection_reason = "producer-pid";
+        else if (sender_pidversion != source->producer_pidversion)
+            rejection_reason = "producer-pidversion";
         if (!rejection_reason) break;
 
         fprintf(stderr,
                 "native_source rejected frame-ready reason=%s sender_pid=%d "
-                "producer_pid=%u\n",
+                "producer_pid=%u sender_pidversion=%u producer_pidversion=%u\n",
                 rejection_reason,
                 sender_pid,
-                source->producer_pid);
+                source->producer_pid,
+                sender_pidversion,
+                source->producer_pidversion);
         mach_msg_destroy(&received.frame.header);
     }
 
