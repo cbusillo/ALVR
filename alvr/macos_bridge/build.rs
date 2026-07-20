@@ -44,6 +44,7 @@ fn main() {
     println!("cargo:rustc-link-lib=framework=IOSurface");
     println!("cargo:rustc-link-lib=framework=Metal");
     println!("cargo:rustc-link-lib=bsm");
+    println!("cargo:rustc-link-lib=proc");
     println!("cargo:rerun-if-changed=src/bgra_to_nv12.metal");
     println!("cargo:rerun-if-changed=src/metal_converter.mm");
     println!("cargo:rerun-if-changed=src/native_source.c");

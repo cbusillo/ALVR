@@ -60,6 +60,9 @@ unsafe extern "C" {
         error_buffer: *mut c_char,
         error_capacity: usize,
     ) -> c_int;
+    fn alvr_native_source_producer_pid(source: *mut c_void) -> u32;
+    fn alvr_native_source_producer_pidversion(source: *mut c_void) -> u32;
+    fn alvr_native_source_producer_start_token(source: *mut c_void) -> u64;
     fn alvr_native_source_next_frame(
         source: *mut c_void,
         timeout_ms: u32,
@@ -82,6 +85,12 @@ pub struct NativeSource {
     source: NonNull<c_void>,
     width: u32,
     height: u32,
+}
+
+pub struct AuthenticatedProducer {
+    pub pid: u32,
+    pub pid_version: u32,
+    pub start_token: u64,
 }
 
 pub struct NativeSourceFrame<'a> {
@@ -121,7 +130,7 @@ impl NativeSource {
             .ok_or_else(|| anyhow!(error_message(&error)))
     }
 
-    pub fn accept_producer(&self, timeout: Duration) -> Result<()> {
+    pub fn accept_producer(&self, timeout: Duration) -> Result<AuthenticatedProducer> {
         let mut error = [0 as c_char; ERROR_CAPACITY];
         let status = unsafe {
             alvr_native_source_accept(
@@ -136,7 +145,20 @@ impl NativeSource {
             "IOSurface producer handshake failed: {}",
             error_message(&error)
         );
-        Ok(())
+        let producer_pid = unsafe { alvr_native_source_producer_pid(self.source.as_ptr()) };
+        let producer_pid_version =
+            unsafe { alvr_native_source_producer_pidversion(self.source.as_ptr()) };
+        let producer_start_token =
+            unsafe { alvr_native_source_producer_start_token(self.source.as_ptr()) };
+        ensure!(
+            producer_pid != 0 && producer_pid_version != 0 && producer_start_token != 0,
+            "IOSurface producer handshake returned incomplete authenticated identity"
+        );
+        Ok(AuthenticatedProducer {
+            pid: producer_pid,
+            pid_version: producer_pid_version,
+            start_token: producer_start_token,
+        })
     }
 
     pub fn next_frame(&self, timeout: Duration) -> Result<Option<NativeSourceFrame<'_>>> {

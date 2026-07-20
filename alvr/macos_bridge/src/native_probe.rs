@@ -239,10 +239,19 @@ pub fn run_native_source_probe(
         "native_source awaiting producer handshake timeout_ms={}",
         PRODUCER_HANDSHAKE_TIMEOUT.as_millis()
     );
-    source.accept_producer(PRODUCER_HANDSHAKE_TIMEOUT)?;
+    let producer = source.accept_producer(PRODUCER_HANDSHAKE_TIMEOUT)?;
     println!(
-        "native_source producer handshake accepted service={} source={}x{}",
-        config.service_name, config.source_width, config.source_height
+        "{}",
+        producer_handshake_message(
+            &config.service_name,
+            config.session_nonce,
+            std::process::id(),
+            producer.pid,
+            producer.pid_version,
+            producer.start_token,
+            config.source_width,
+            config.source_height,
+        )
     );
     let mut self_test_slots = [false; SOURCE_SLOT_COUNT];
     for _ in 0..SOURCE_SLOT_COUNT {
@@ -705,6 +714,29 @@ fn visible_content_observed(black_samples: u64, visible_samples: u64) -> bool {
     black_samples + visible_samples == 0 || visible_samples > 0
 }
 
+fn producer_handshake_message(
+    service_name: &str,
+    session_nonce: u64,
+    bridge_pid: u32,
+    producer_pid: u32,
+    producer_pid_version: u32,
+    producer_start_token: u64,
+    source_width: u32,
+    source_height: u32,
+) -> String {
+    format!(
+        "native_source producer handshake accepted service={} nonce={} bridge_pid={} producer_pid={} producer_pidversion={} producer_start_token={} source={}x{}",
+        service_name,
+        session_nonce,
+        bridge_pid,
+        producer_pid,
+        producer_pid_version,
+        producer_start_token,
+        source_width,
+        source_height
+    )
+}
+
 fn env_u32(name: &str, default: u32) -> Result<u32> {
     env::var(name).map_or(Ok(default), |value| {
         value.parse().with_context(|| format!("invalid {name}"))
@@ -744,5 +776,22 @@ mod tests {
         assert!(visible_content_observed(0, 0));
         assert!(!visible_content_observed(2, 0));
         assert!(visible_content_observed(2, 1));
+    }
+
+    #[test]
+    fn handshake_log_binds_nonce_and_authenticated_producer_pid() {
+        assert_eq!(
+            producer_handshake_message(
+                "com.alvr.fixture",
+                42,
+                4321,
+                9002,
+                77,
+                1_721_278_802_123_456,
+                3240,
+                1800,
+            ),
+            "native_source producer handshake accepted service=com.alvr.fixture nonce=42 bridge_pid=4321 producer_pid=9002 producer_pidversion=77 producer_start_token=1721278802123456 source=3240x1800"
+        );
     }
 }
