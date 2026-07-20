@@ -186,7 +186,15 @@ pub fn run_surface_probe(
     })?;
     let mut sink = config
         .connect_to_alvr
-        .then(|| AlvrVideoSink::start(&config.alvr_root, config.width, config.height, config.fps))
+        .then(|| {
+            AlvrVideoSink::start(
+                &config.alvr_root,
+                config.width,
+                config.height,
+                config.fps,
+                0,
+            )
+        })
         .transpose()?;
     let fallback_view_params = default_stereo_view_params(config.width, config.height);
     let frame_interval = Duration::from_secs_f64(1.0 / f64::from(config.fps));

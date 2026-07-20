@@ -27,6 +27,7 @@ alvr_session.workspace = true
 
 serde_json = "1"
 memmap2 = "0.9"
+libc = "0.2"
 shiguredo_video_toolbox = "=2026.2.0-canary.0"
 
 [build-dependencies]

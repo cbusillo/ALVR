@@ -1,6 +1,6 @@
 use alvr_common::{DeviceMotion, Pose, ViewParams, glam::Mat4, inputs as inp};
 use alvr_packets::{ButtonEntry, ButtonValue};
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, ensure};
 use memmap2::{MmapMut, MmapOptions};
 use std::{
     fs::{File, OpenOptions},
@@ -12,13 +12,17 @@ use std::{
 };
 
 #[cfg(unix)]
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 
 const SHM_PATH: &str = "/tmp/alvr_frame_buffer.shm";
 const SHM_MAGIC: u32 = 0x414C5652;
-const SHM_VERSION: u32 = 6;
+const SHM_VERSION: u32 = 7;
 const NUM_BUFFERS: usize = 3;
 const NUM_CONTROLLERS: usize = 2;
+
+const CLIENT_STATE_WAITING: u32 = 0;
+const CLIENT_STATE_CONNECTED: u32 = 1;
+const CLIENT_STATE_STREAMING: u32 = 2;
 
 const BUTTON_SYSTEM: u64 = 1 << 0;
 const BUTTON_APPLICATION_MENU: u64 = 1 << 1;
@@ -96,6 +100,17 @@ struct SharedMemoryHeader {
     hmd_pose: [[f32; 4]; 3],
     frame_headers: [FrameHeaderRaw; NUM_BUFFERS],
     controllers: [ControllerStateRaw; NUM_CONTROLLERS],
+    telemetry_sequence: AtomicU32,
+    client_state: AtomicU32,
+    stream_contract_valid: AtomicU32,
+    telemetry_reserved: u32,
+    runtime_generation: AtomicU64,
+    bridge_pid: AtomicU64,
+    stream_epoch: AtomicU64,
+    frames_transported: AtomicU64,
+    connect_events: AtomicU64,
+    disconnect_events: AtomicU64,
+    contract_failure_events: AtomicU64,
 }
 
 const _: () = {
@@ -105,9 +120,11 @@ const _: () = {
     assert!(mem::offset_of!(SharedMemoryHeader, hmd_pose_timestamp_ns) == 144);
     assert!(mem::offset_of!(SharedMemoryHeader, frame_headers) == 256);
     assert!(mem::offset_of!(SharedMemoryHeader, controllers) == 640);
+    assert!(mem::offset_of!(SharedMemoryHeader, telemetry_sequence) == 992);
     assert!(mem::size_of::<FrameHeaderRaw>() == 128);
     assert!(mem::size_of::<ControllerStateRaw>() == 176);
-    assert!(mem::size_of::<SharedMemoryHeader>() == 992);
+    assert!(mem::offset_of!(SharedMemoryHeader, connect_events) == 1040);
+    assert!(mem::size_of::<SharedMemoryHeader>() == 1064);
 };
 
 pub(crate) struct TrackingFeedback {
@@ -116,24 +133,35 @@ pub(crate) struct TrackingFeedback {
 }
 
 impl TrackingFeedback {
-    pub(crate) fn create() -> Result<Self> {
-        Self::create_at(Path::new(SHM_PATH))
+    pub(crate) fn create(runtime_generation: u64) -> Result<Self> {
+        Self::create_at(Path::new(SHM_PATH), runtime_generation)
     }
 
-    fn create_at(path: &Path) -> Result<Self> {
+    fn create_at(path: &Path, runtime_generation: u64) -> Result<Self> {
         let mut options = OpenOptions::new();
         options.read(true).write(true).create(true);
         #[cfg(unix)]
-        options.mode(0o600);
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
 
         let file = options
             .open(path)
             .with_context(|| format!("failed to create {}", path.display()))?;
-        let header_size = mem::size_of::<SharedMemoryHeader>();
-        let existing_size = file
+        let metadata = file
             .metadata()
-            .with_context(|| format!("failed to inspect {}", path.display()))?
-            .len();
+            .with_context(|| format!("failed to inspect {}", path.display()))?;
+        #[cfg(unix)]
+        ensure!(
+            metadata.is_file()
+                && metadata.uid() == unsafe { libc::geteuid() }
+                && metadata.nlink() == 1,
+            "shared memory path has unsafe type or ownership: {}",
+            path.display()
+        );
+        #[cfg(unix)]
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("failed to secure {}", path.display()))?;
+        let header_size = mem::size_of::<SharedMemoryHeader>();
+        let existing_size = metadata.len();
         if existing_size < header_size as u64 {
             file.set_len(header_size as u64)
                 .with_context(|| format!("failed to size {}", path.display()))?;
@@ -143,9 +171,13 @@ impl TrackingFeedback {
         let compatible_header = existing_size >= header_size as u64
             && mmap[..4] == SHM_MAGIC.to_ne_bytes()
             && mmap[4..8] == SHM_VERSION.to_ne_bytes();
-        if !compatible_header {
-            mmap.fill(0);
+        if compatible_header {
+            let header = unsafe { &*(mmap.as_ptr().cast::<SharedMemoryHeader>()) };
+            header.shutdown.store(1, Ordering::SeqCst);
+            header.initialized.store(0, Ordering::SeqCst);
+            fence(Ordering::SeqCst);
         }
+        mmap.fill(0);
 
         let mut feedback = Self { _file: file, mmap };
         let session_id = unix_time_ns() ^ u64::from(process::id());
@@ -171,6 +203,24 @@ impl TrackingFeedback {
         header
             .bridge_heartbeat_ns
             .store(heartbeat, Ordering::Relaxed);
+        let telemetry_sequence = begin_feedback_write(&header.telemetry_sequence);
+        header
+            .client_state
+            .store(CLIENT_STATE_WAITING, Ordering::Relaxed);
+        header.stream_contract_valid.store(0, Ordering::Relaxed);
+        header.telemetry_reserved = 0;
+        header
+            .runtime_generation
+            .store(runtime_generation, Ordering::Relaxed);
+        header
+            .bridge_pid
+            .store(u64::from(process::id()), Ordering::Relaxed);
+        header.stream_epoch.store(0, Ordering::Relaxed);
+        header.frames_transported.store(0, Ordering::Relaxed);
+        header.connect_events.store(0, Ordering::Relaxed);
+        header.disconnect_events.store(0, Ordering::Relaxed);
+        header.contract_failure_events.store(0, Ordering::Relaxed);
+        finish_feedback_write(&header.telemetry_sequence, telemetry_sequence);
         header.shutdown.store(0, Ordering::Release);
         header.initialized.store(1, Ordering::Release);
 
@@ -181,6 +231,54 @@ impl TrackingFeedback {
         self.header_mut()
             .bridge_heartbeat_ns
             .store(unix_time_ns(), Ordering::Relaxed);
+    }
+
+    pub(crate) fn publish_client_connected(&mut self, stream_epoch: u64, contract_valid: bool) {
+        let header = self.header_mut();
+        let sequence = begin_feedback_write(&header.telemetry_sequence);
+        header
+            .client_state
+            .store(CLIENT_STATE_CONNECTED, Ordering::Relaxed);
+        header
+            .stream_contract_valid
+            .store(u32::from(contract_valid), Ordering::Relaxed);
+        header.stream_epoch.store(stream_epoch, Ordering::Relaxed);
+        header.connect_events.fetch_add(1, Ordering::Relaxed);
+        if !contract_valid {
+            header
+                .contract_failure_events
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        finish_feedback_write(&header.telemetry_sequence, sequence);
+    }
+
+    pub(crate) fn publish_client_disconnected(&mut self, stream_epoch: u64) {
+        let header = self.header_mut();
+        let sequence = begin_feedback_write(&header.telemetry_sequence);
+        header
+            .client_state
+            .store(CLIENT_STATE_WAITING, Ordering::Relaxed);
+        header.stream_contract_valid.store(0, Ordering::Relaxed);
+        header.stream_epoch.store(stream_epoch, Ordering::Relaxed);
+        header.disconnect_events.fetch_add(1, Ordering::Relaxed);
+        finish_feedback_write(&header.telemetry_sequence, sequence);
+    }
+
+    pub(crate) fn publish_frame_transported(&mut self, stream_epoch: u64) -> bool {
+        let header = self.header_mut();
+        if header.stream_epoch.load(Ordering::Acquire) != stream_epoch
+            || header.stream_contract_valid.load(Ordering::Acquire) == 0
+        {
+            return false;
+        }
+        let sequence = begin_feedback_write(&header.telemetry_sequence);
+        header
+            .client_state
+            .store(CLIENT_STATE_STREAMING, Ordering::Relaxed);
+        header.frames_transported.fetch_add(1, Ordering::Relaxed);
+        finish_feedback_write(&header.telemetry_sequence, sequence);
+
+        true
     }
 
     pub(crate) fn reset(&mut self) {
@@ -548,6 +646,12 @@ fn set_axis(axis: &mut f32, value: f32) -> bool {
 impl Drop for TrackingFeedback {
     fn drop(&mut self) {
         let header = self.header_mut();
+        let sequence = begin_feedback_write(&header.telemetry_sequence);
+        header
+            .client_state
+            .store(CLIENT_STATE_WAITING, Ordering::Relaxed);
+        header.stream_contract_valid.store(0, Ordering::Relaxed);
+        finish_feedback_write(&header.telemetry_sequence, sequence);
         header
             .bridge_heartbeat_ns
             .store(unix_time_ns(), Ordering::Relaxed);
@@ -633,7 +737,7 @@ mod tests {
             process::id(),
             unix_time_ns()
         ));
-        let mut feedback = TrackingFeedback::create_at(&path).unwrap();
+        let mut feedback = TrackingFeedback::create_at(&path, 42).unwrap();
         let params = [
             ViewParams {
                 pose: Pose {
@@ -673,6 +777,15 @@ mod tests {
         assert_eq!(header.version, SHM_VERSION);
         assert_eq!(header.initialized.load(Ordering::Acquire), 1);
         assert_eq!(header.shutdown.load(Ordering::Acquire), 0);
+        assert_eq!(header.runtime_generation.load(Ordering::Acquire), 42);
+        assert_eq!(
+            header.bridge_pid.load(Ordering::Acquire),
+            u64::from(process::id())
+        );
+        assert_eq!(
+            header.client_state.load(Ordering::Acquire),
+            CLIENT_STATE_WAITING
+        );
         assert_eq!(header.view_config_set.load(Ordering::Acquire), 1);
         assert_eq!(header.view_eye_x_m, [-0.032, 0.032]);
         assert_eq!(header.hmd_pose_set.load(Ordering::Acquire), 1);
@@ -698,7 +811,7 @@ mod tests {
             process::id(),
             unix_time_ns()
         ));
-        let mut feedback = TrackingFeedback::create_at(&path).unwrap();
+        let mut feedback = TrackingFeedback::create_at(&path, 43).unwrap();
         let motion = DeviceMotion {
             pose: Pose {
                 orientation: Quat::IDENTITY,
@@ -776,10 +889,117 @@ mod tests {
         file.set_len(4096).unwrap();
         drop(file);
 
-        let feedback = TrackingFeedback::create_at(&path).unwrap();
-        assert_eq!(fs::metadata(&path).unwrap().len(), 4096);
+        let feedback = TrackingFeedback::create_at(&path, 44).unwrap();
+        let metadata = fs::metadata(&path).unwrap();
+        assert_eq!(metadata.len(), 4096);
+        assert_eq!(metadata.mode() & 0o777, 0o600);
 
         drop(feedback);
         fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn publishes_generation_bound_client_transitions() {
+        let path = std::env::temp_dir().join(format!(
+            "alvr-client-telemetry-{}-{}",
+            process::id(),
+            unix_time_ns()
+        ));
+        let mut feedback = TrackingFeedback::create_at(&path, 45).unwrap();
+
+        feedback.publish_client_connected(1, true);
+        {
+            let header = feedback.header_mut();
+            assert_eq!(
+                header.client_state.load(Ordering::Acquire),
+                CLIENT_STATE_CONNECTED
+            );
+            assert_eq!(header.stream_contract_valid.load(Ordering::Acquire), 1);
+            assert_eq!(header.stream_epoch.load(Ordering::Acquire), 1);
+            assert_eq!(header.frames_transported.load(Ordering::Acquire), 0);
+            assert_eq!(header.connect_events.load(Ordering::Acquire), 1);
+            assert_eq!(header.disconnect_events.load(Ordering::Acquire), 0);
+            assert_eq!(header.contract_failure_events.load(Ordering::Acquire), 0);
+            assert!(
+                header
+                    .telemetry_sequence
+                    .load(Ordering::Acquire)
+                    .is_multiple_of(2)
+            );
+        }
+
+        assert!(feedback.publish_frame_transported(1));
+        assert!(!feedback.publish_frame_transported(2));
+        {
+            let header = feedback.header_mut();
+            assert_eq!(
+                header.client_state.load(Ordering::Acquire),
+                CLIENT_STATE_STREAMING
+            );
+            assert_eq!(header.frames_transported.load(Ordering::Acquire), 1);
+        }
+
+        feedback.publish_client_disconnected(2);
+        {
+            let header = feedback.header_mut();
+            assert_eq!(
+                header.client_state.load(Ordering::Acquire),
+                CLIENT_STATE_WAITING
+            );
+            assert_eq!(header.stream_contract_valid.load(Ordering::Acquire), 0);
+            assert_eq!(header.stream_epoch.load(Ordering::Acquire), 2);
+            assert_eq!(header.frames_transported.load(Ordering::Acquire), 1);
+            assert_eq!(header.connect_events.load(Ordering::Acquire), 1);
+            assert_eq!(header.disconnect_events.load(Ordering::Acquire), 1);
+        }
+
+        drop(feedback);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn latches_stream_contract_failures_across_disconnect() {
+        let path = std::env::temp_dir().join(format!(
+            "alvr-client-contract-failure-{}-{}",
+            process::id(),
+            unix_time_ns()
+        ));
+        let mut feedback = TrackingFeedback::create_at(&path, 47).unwrap();
+
+        feedback.publish_client_connected(1, false);
+        feedback.publish_client_disconnected(2);
+
+        let header = feedback.header_mut();
+        assert_eq!(
+            header.client_state.load(Ordering::Acquire),
+            CLIENT_STATE_WAITING
+        );
+        assert_eq!(header.connect_events.load(Ordering::Acquire), 1);
+        assert_eq!(header.disconnect_events.load(Ordering::Acquire), 1);
+        assert_eq!(header.contract_failure_events.load(Ordering::Acquire), 1);
+
+        drop(feedback);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn rejects_symlinked_shared_memory_path() {
+        let target = std::env::temp_dir().join(format!(
+            "alvr-client-telemetry-target-{}-{}",
+            process::id(),
+            unix_time_ns()
+        ));
+        let link = std::env::temp_dir().join(format!(
+            "alvr-client-telemetry-link-{}-{}",
+            process::id(),
+            unix_time_ns()
+        ));
+        File::create(&target).unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        assert!(TrackingFeedback::create_at(&link, 46).is_err());
+
+        fs::remove_file(link).unwrap();
+        fs::remove_file(target).unwrap();
     }
 }
