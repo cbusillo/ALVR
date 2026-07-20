@@ -69,7 +69,13 @@ pub struct AlvrVideoSink {
 }
 
 impl AlvrVideoSink {
-    pub fn start(root: &Path, width: u32, height: u32, fps: u32) -> Result<Self> {
+    pub fn start(
+        root: &Path,
+        width: u32,
+        height: u32,
+        fps: u32,
+        runtime_generation: u64,
+    ) -> Result<Self> {
         ensure!(
             width > 0 && width.is_multiple_of(64),
             "ALVR stream width must be positive and divisible by 64"
@@ -87,7 +93,7 @@ impl AlvrVideoSink {
 
         let (context, events) = ServerCoreContext::new();
         context.start_connection();
-        let tracking_feedback = TrackingFeedback::create()?;
+        let tracking_feedback = TrackingFeedback::create(runtime_generation)?;
 
         Ok(Self {
             context,
@@ -163,6 +169,10 @@ impl AlvrVideoSink {
                     self.decoder_config_sent = false;
                     self.decoder_bootstrap.reset();
                     self.tracking_feedback.reset();
+                    self.tracking_feedback.publish_client_connected(
+                        self.stream_epoch,
+                        self.connection_error.is_none(),
+                    );
                     self.feedback_view_published = false;
                     self.feedback_pose_published = false;
                     self.feedback_view_logged = false;
@@ -184,6 +194,8 @@ impl AlvrVideoSink {
                     self.decoder_config_sent = false;
                     self.decoder_bootstrap.reset();
                     self.tracking_feedback.reset();
+                    self.tracking_feedback
+                        .publish_client_disconnected(self.stream_epoch);
                     self.feedback_view_published = false;
                     self.feedback_pose_published = false;
                     self.feedback_view_logged = false;
@@ -282,21 +294,6 @@ impl AlvrVideoSink {
                 }
             }
         }
-    }
-
-    pub fn ready_for_frames(&mut self) -> Result<bool> {
-        self.poll_events();
-        ensure!(
-            self.connection_error.is_none(),
-            "{}",
-            self.connection_error.as_deref().unwrap_or_default()
-        );
-        ensure!(
-            !self.shutdown_requested,
-            "ALVR shutdown requested before streaming"
-        );
-
-        Ok(self.connected)
     }
 
     pub fn frame_metadata(
@@ -430,12 +427,21 @@ impl AlvrVideoSink {
             self.force_keyframe = true;
             return Ok(false);
         }
-        Ok(self.context.send_video_nal(
+        let transported = self.context.send_video_nal(
             frame.metadata.video_timestamp,
             frame.metadata.global_view_params,
             frame.is_keyframe,
             frame.nal_data,
-        ))
+        );
+        if transported {
+            ensure!(
+                self.tracking_feedback
+                    .publish_frame_transported(self.stream_epoch),
+                "ALVR client telemetry stream epoch changed during transport"
+            );
+        }
+
+        Ok(transported)
     }
 
     pub fn ever_connected(&self) -> bool {

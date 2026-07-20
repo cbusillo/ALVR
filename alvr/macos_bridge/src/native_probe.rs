@@ -10,12 +10,11 @@ use crate::{
 };
 use anyhow::{Context, Result, ensure};
 use std::{
-    env, fmt, thread,
+    env, fmt,
     time::{Duration, Instant},
 };
 
 const PRODUCER_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(600);
-const ALVR_READY_TIMEOUT: Duration = Duration::from_secs(5);
 const EXACT_POSE_STARTUP_TIMEOUT: Duration = Duration::from_secs(90);
 
 #[derive(Debug, Clone)]
@@ -300,20 +299,10 @@ pub fn run_native_source_probe(
                 config.probe.width,
                 config.probe.height,
                 config.probe.fps,
+                config.session_nonce,
             )
         })
         .transpose()?;
-    if let Some(sink) = sink.as_mut() {
-        let deadline = Instant::now() + ALVR_READY_TIMEOUT;
-        while !sink.ready_for_frames()? {
-            ensure!(
-                Instant::now() < deadline,
-                "ALVR client did not connect within {} ms before production startup",
-                ALVR_READY_TIMEOUT.as_millis()
-            );
-            thread::sleep(Duration::from_millis(5));
-        }
-    }
     let startup_barrier = source
         .next_frame(Duration::from_secs(60))?
         .context("IOSurface producer did not send the startup barrier")?;
@@ -329,7 +318,7 @@ pub fn run_native_source_probe(
     );
     println!("native_source producer startup barrier released");
     if sink.is_some() {
-        println!("native_source ALVR ready before production frames");
+        println!("native_source ALVR client telemetry enabled");
     }
     println!(
         "native_source startup self-tests passed slots={}",

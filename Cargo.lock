@@ -389,6 +389,7 @@ dependencies = [
  "alvr_session",
  "anyhow",
  "cc",
+ "libc",
  "memmap2",
  "serde_json",
  "shiguredo_video_toolbox",
