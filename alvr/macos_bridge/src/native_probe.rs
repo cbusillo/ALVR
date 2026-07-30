@@ -233,6 +233,22 @@ pub fn run_native_source_probe(
         bitrate_bps: config.probe.bitrate_bps,
     })?;
     let fallback_view_params = default_stereo_view_params(config.probe.width, config.probe.height);
+    let mut sink = config
+        .probe
+        .connect_to_alvr
+        .then(|| {
+            AlvrVideoSink::start(
+                &config.probe.alvr_root,
+                config.probe.width,
+                config.probe.height,
+                config.probe.fps,
+                config.session_nonce,
+            )
+        })
+        .transpose()?;
+    if sink.is_some() {
+        println!("native_source ALVR client telemetry enabled");
+    }
 
     println!(
         "native_source awaiting producer handshake timeout_ms={}",
@@ -290,19 +306,6 @@ pub fn run_native_source_probe(
         self_test_slots.iter().all(|passed| *passed),
         "not every IOSurface slot passed startup self-test"
     );
-    let mut sink = config
-        .probe
-        .connect_to_alvr
-        .then(|| {
-            AlvrVideoSink::start(
-                &config.probe.alvr_root,
-                config.probe.width,
-                config.probe.height,
-                config.probe.fps,
-                config.session_nonce,
-            )
-        })
-        .transpose()?;
     let startup_barrier = source
         .next_frame(Duration::from_secs(60))?
         .context("IOSurface producer did not send the startup barrier")?;
@@ -317,9 +320,6 @@ pub fn run_native_source_probe(
         "IOSurface startup barrier failed validation status={startup_barrier_status}"
     );
     println!("native_source producer startup barrier released");
-    if sink.is_some() {
-        println!("native_source ALVR client telemetry enabled");
-    }
     println!(
         "native_source startup self-tests passed slots={}",
         SOURCE_SLOT_COUNT
