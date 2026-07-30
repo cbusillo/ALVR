@@ -15,6 +15,7 @@ use std::{
 };
 
 const PRODUCER_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(600);
+const ALVR_CONNECTION_TIMEOUT: Duration = Duration::from_secs(600);
 const EXACT_POSE_STARTUP_TIMEOUT: Duration = Duration::from_secs(90);
 
 #[derive(Debug, Clone)]
@@ -233,23 +234,6 @@ pub fn run_native_source_probe(
         bitrate_bps: config.probe.bitrate_bps,
     })?;
     let fallback_view_params = default_stereo_view_params(config.probe.width, config.probe.height);
-    let mut sink = config
-        .probe
-        .connect_to_alvr
-        .then(|| {
-            AlvrVideoSink::start(
-                &config.probe.alvr_root,
-                config.probe.width,
-                config.probe.height,
-                config.probe.fps,
-                config.session_nonce,
-            )
-        })
-        .transpose()?;
-    if sink.is_some() {
-        println!("native_source ALVR client telemetry enabled");
-    }
-
     println!(
         "native_source awaiting producer handshake timeout_ms={}",
         PRODUCER_HANDSHAKE_TIMEOUT.as_millis()
@@ -306,6 +290,27 @@ pub fn run_native_source_probe(
         self_test_slots.iter().all(|passed| *passed),
         "not every IOSurface slot passed startup self-test"
     );
+    let mut sink = config
+        .probe
+        .connect_to_alvr
+        .then(|| {
+            AlvrVideoSink::start(
+                &config.probe.alvr_root,
+                config.probe.width,
+                config.probe.height,
+                config.probe.fps,
+                config.session_nonce,
+            )
+        })
+        .transpose()?;
+    if let Some(sink) = sink.as_mut() {
+        println!("native_source ALVR client telemetry enabled");
+        println!(
+            "native_source awaiting ALVR client connection timeout_ms={}",
+            ALVR_CONNECTION_TIMEOUT.as_millis()
+        );
+        wait_for_alvr_connection(sink, ALVR_CONNECTION_TIMEOUT)?;
+    }
     let startup_barrier = source
         .next_frame(Duration::from_secs(60))?
         .context("IOSurface producer did not send the startup barrier")?;
@@ -724,6 +729,29 @@ fn producer_handshake_message(
         source_width,
         source_height
     )
+}
+
+fn wait_for_alvr_connection(sink: &mut AlvrVideoSink, timeout: Duration) -> Result<()> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        sink.poll_events();
+        if let Some(error) = sink.connection_error() {
+            anyhow::bail!("ALVR client connection contract failed: {error}");
+        }
+        if sink.is_connected() {
+            return Ok(());
+        }
+        ensure!(
+            !sink.shutdown_requested(),
+            "ALVR client connection shut down before startup barrier release"
+        );
+        ensure!(
+            Instant::now() < deadline,
+            "ALVR client did not connect within {} ms before startup barrier release",
+            timeout.as_millis()
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
 }
 
 fn env_u32(name: &str, default: u32) -> Result<u32> {

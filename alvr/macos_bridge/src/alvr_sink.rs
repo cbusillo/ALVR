@@ -448,6 +448,10 @@ impl AlvrVideoSink {
         self.ever_connected
     }
 
+    pub fn is_connected(&self) -> bool {
+        self.connected
+    }
+
     pub fn shutdown_requested(&self) -> bool {
         self.shutdown_requested
     }
