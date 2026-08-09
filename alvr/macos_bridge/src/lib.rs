@@ -7,6 +7,8 @@ mod alvr_sink;
 #[cfg(target_os = "macos")]
 mod encoder;
 #[cfg(target_os = "macos")]
+mod local_network_consent;
+#[cfg(target_os = "macos")]
 mod metal;
 #[cfg(target_os = "macos")]
 mod native_probe;
@@ -25,6 +27,10 @@ pub use alvr_sink::AlvrVideoSink;
 pub use encoder::{
     EncodedFrame, HardwareEncoderSupport, NativeHevcEncoder, NativeHevcEncoderConfig,
     hevc_hardware_support,
+};
+#[cfg(target_os = "macos")]
+pub use local_network_consent::{
+    LocalNetworkConsentArgs, LocalNetworkConsentOutcome, run_local_network_consent,
 };
 #[cfg(target_os = "macos")]
 pub use native_probe::{
