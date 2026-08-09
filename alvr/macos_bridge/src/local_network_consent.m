@@ -24,6 +24,7 @@ int alvr_run_local_network_consent(void)
     @autoreleasepool {
         NSApplication *application = [NSApplication sharedApplication];
         [application setActivationPolicy:NSApplicationActivationPolicyRegular];
+        [application finishLaunching];
 
         NSAlert *alert = [[NSAlert alloc] init];
         alert.messageText = @"Allow Local Network access for ALVR macOS Bridge";
@@ -97,6 +98,8 @@ int alvr_run_local_network_consent(void)
             });
 
         [application activateIgnoringOtherApps:YES];
+        [alert.window center];
+        [alert.window makeKeyAndOrderFront:nil];
         [alert runModal];
         nw_browser_cancel(browser);
         return outcome;
