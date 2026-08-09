@@ -38,15 +38,23 @@ fn main() {
         .include("src")
         .flag("-std=c11")
         .compile("alvr_macos_native_source");
+    cc::Build::new()
+        .file("src/local_network_consent.m")
+        .flag("-fobjc-arc")
+        .flag("-fblocks")
+        .compile("alvr_macos_local_network_consent");
 
+    println!("cargo:rustc-link-lib=framework=AppKit");
     println!("cargo:rustc-link-lib=framework=CoreFoundation");
     println!("cargo:rustc-link-lib=framework=CoreVideo");
     println!("cargo:rustc-link-lib=framework=IOSurface");
     println!("cargo:rustc-link-lib=framework=Metal");
+    println!("cargo:rustc-link-lib=framework=Network");
     println!("cargo:rustc-link-lib=bsm");
     println!("cargo:rustc-link-lib=proc");
     println!("cargo:rerun-if-changed=src/bgra_to_nv12.metal");
     println!("cargo:rerun-if-changed=src/metal_converter.mm");
     println!("cargo:rerun-if-changed=src/native_source.c");
+    println!("cargo:rerun-if-changed=src/local_network_consent.m");
     println!("cargo:rerun-if-changed=src/iosurface_handoff_protocol.h");
 }

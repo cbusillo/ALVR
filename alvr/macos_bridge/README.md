@@ -70,6 +70,25 @@ persist upstream restart settings; without an ALVR dashboard process, rerun the
 same bounded command once. Connect mode succeeds only after it observes a real
 `ClientConnected` event. Removing that probe root cleans up the generated files.
 
+## Foreground Local Network consent
+
+The packaged bridge can request macOS Local Network consent through the same
+Mach-O executable identity used by the launchd runtime:
+
+```bash
+open -W -n /path/to/ALVRMacOSBridge.app --args \
+  --local-network-consent \
+  --result-path /absolute/private/result.json
+```
+
+This mode opens an AppKit consent window and starts a Network.framework Bonjour
+browse for `_alvr._tcp`. It does not initialize the IOSurface producer, encoder,
+or launchd Mach service. The result file is created with mode `0600` and reports
+the browser's current `ready`, `policy-denied`, `waiting`, `failed`, `cancelled`,
+or `setup-failed` state. A `ready` result proves only that discovery is currently
+available to this executable identity; it is not a general macOS permission
+database query.
+
 ## Deliberate limits
 
 - The probe directly mutates a small surface marker; it is not a real Metal,
